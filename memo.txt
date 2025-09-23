@@ -1,0 +1,13 @@
+data
+ - test
+    - good
+    - error
+ - train
+    - good
+params
+result
+.python-version
+main.py
+pyproject.toml
+setting.ini
+uv.lock
