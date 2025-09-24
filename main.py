@@ -1,6 +1,7 @@
 import configparser
 import logging
 import math
+import os
 import sys
 import traceback
 import types
@@ -15,7 +16,6 @@ import torch.nn as nn
 from anomalib.data import Folder
 from anomalib.models.image.fastflow import Fastflow
 from anomalib.models.image.fastflow.torch_model import create_fast_flow_block
-from anomalib.pre_processing.pre_processor import PreProcessor
 from anomalib.visualization import visualize_anomaly_map
 from lightning.pytorch import Callback, Trainer, seed_everything
 from PIL import Image
@@ -29,6 +29,47 @@ warnings.filterwarnings(
     "ignore", message="The 'train_dataloader' does not have many workers"
 )
 warnings.filterwarnings("ignore", message="Trying to infer the `batch_size`")
+
+
+MODELS_DIR = (Path(__file__).resolve().parent / "models").resolve()
+OFFLINE_ENV_VARS = (
+    "HF_DATASETS_OFFLINE",
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+)
+
+
+def _disable_offline_env() -> dict:
+    saved = {}
+    for key in OFFLINE_ENV_VARS:
+        saved[key] = os.environ.pop(key, None)
+    return saved
+
+
+def _restore_offline_env(saved: dict) -> None:
+    for key, value in saved.items():
+        if value is not None:
+            os.environ[key] = value
+
+
+def _sanitize_backbone_name(backbone: str) -> str:
+    return backbone.replace("/", "_")
+
+
+def configure_offline_environment(models_dir: Path) -> None:
+    models_dir.mkdir(parents=True, exist_ok=True)
+    resolved = str(models_dir)
+    os.environ.setdefault("TORCH_HOME", resolved)
+    os.environ.setdefault("TIMM_HOME", resolved)
+    os.environ.setdefault("HF_HOME", resolved)
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", resolved)
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+
+configure_offline_environment(MODELS_DIR)
+
 
 def log(message: str) -> None:
     print(message)
@@ -351,10 +392,119 @@ def build_datamodule(cfg: AppConfig, transform) -> Folder:
     return dm
 
 
+def download_pretrained_weights(backbone: str, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        return destination
+    saved_env = _disable_offline_env()
+    state_dict = None
+    model = None
+    try:
+        import timm
+
+        log(
+            f"weights_download_start backbone={backbone} target={destination}"
+        )
+        model = timm.create_model(backbone, pretrained=True)
+        state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    except Exception as exc:  # pragma: no cover - depends on external availability
+        raise RuntimeError(
+            f"failed to download pretrained weights for '{backbone}'"
+        ) from exc
+    finally:
+        if model is not None:
+            del model
+        _restore_offline_env(saved_env)
+    if state_dict is None:
+        raise RuntimeError(
+            f"unable to obtain pretrained weights for '{backbone}'"
+        )
+    torch.save(state_dict, destination)
+    log(
+        f"weights_download_complete backbone={backbone} saved={destination}"
+    )
+    return destination
+
+
+def locate_pretrained_weights(backbone: str, allow_download: bool = True) -> Path:
+    if not MODELS_DIR.exists():
+        raise FileNotFoundError(
+            f"models directory missing. expected path={MODELS_DIR}"
+        )
+    sanitized = _sanitize_backbone_name(backbone)
+    candidates = [backbone, sanitized]
+    exts = (".pth", ".pt", ".bin")
+    for name in candidates:
+        for ext in exts:
+            candidate = MODELS_DIR / f"{name}{ext}"
+            if candidate.exists():
+                return candidate
+    matches = []
+    for path in sorted(MODELS_DIR.glob("*")):
+        if not path.is_file() or path.suffix not in exts:
+            continue
+        stem = path.stem
+        if any(token in stem for token in candidates):
+            matches.append(path)
+    if matches:
+        return matches[0]
+    if allow_download:
+        downloaded = download_pretrained_weights(
+            backbone, MODELS_DIR / f"{sanitized}.pth"
+        )
+        if downloaded.exists():
+            return downloaded
+    raise FileNotFoundError(
+        f"pretrained weights for backbone '{backbone}' not found under {MODELS_DIR}"
+    )
+
+
+def _normalize_state_dict(raw_state: dict) -> dict:
+    state = raw_state
+    if "state_dict" in state and isinstance(state["state_dict"], dict):
+        state = state["state_dict"]
+    elif "model" in state and isinstance(state["model"], dict):
+        state = state["model"]
+    cleaned = {}
+    for key, value in state.items():
+        new_key = key
+        if new_key.startswith("module."):
+            new_key = new_key[len("module.") :]
+        if new_key.startswith("model."):
+            new_key = new_key[len("model.") :]
+        if new_key.startswith("backbone."):
+            new_key = new_key[len("backbone.") :]
+        cleaned[new_key] = value
+    return cleaned
+
+
+def load_local_pretrained_weights(model: Fastflow, cfg: ModelConfig) -> None:
+    if not hasattr(model, "model"):
+        return
+    feature_extractor = getattr(model.model, "feature_extractor", None)
+    if feature_extractor is None:
+        return
+    weights_path = locate_pretrained_weights(cfg.backbone, allow_download=True)
+    state_object = torch.load(weights_path, map_location="cpu")
+    if not isinstance(state_object, dict):
+        raise RuntimeError(
+            f"unexpected checkpoint format at {weights_path}. expected dict"
+        )
+    state_dict = _normalize_state_dict(state_object)
+    missing, unexpected = feature_extractor.load_state_dict(
+        state_dict, strict=False
+    )
+    log(f"weights_loaded backbone={cfg.backbone} source={weights_path}")
+    if missing:
+        log(f"weights_missing count={len(missing)} example={missing[0]}")
+    if unexpected:
+        log(f"weights_unexpected count={len(unexpected)} example={unexpected[0]}")
+
+
 def build_model(cfg: AppConfig, pre_processor) -> Fastflow:
     model = Fastflow(
         backbone=cfg.model.backbone,
-        pre_trained=True,
+        pre_trained=False,
         flow_steps=cfg.model.flow_steps,
         conv3x3_only=cfg.model.conv3x3_only,
         hidden_ratio=cfg.model.hidden_ratio,
@@ -367,6 +517,7 @@ def build_model(cfg: AppConfig, pre_processor) -> Fastflow:
     apply_learning_rate(model, cfg.model)
     suppress_module_logging(model)
     configure_vit_layers(model, cfg.model)
+    load_local_pretrained_weights(model, cfg.model)
     return model
 
 
