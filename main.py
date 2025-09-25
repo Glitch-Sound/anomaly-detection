@@ -8,7 +8,7 @@ import types
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -214,12 +214,19 @@ class ResultConfig:
 
 
 @dataclass
+class HeatmapConfig:
+    activation_percentile: float
+    activation_min_value: float
+
+
+@dataclass
 class AppConfig:
     model: ModelConfig
     data: DataConfig
     output: OutputConfig
     infer: InferConfig
     result: ResultConfig
+    heatmap: HeatmapConfig
 
 
 class EpochLogger(Callback):
@@ -312,12 +319,25 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
     result_cfg = ResultConfig(
         root=Path(parser.get("RESULT", "output_dir", fallback="result")),
     )
+    activation_percentile = parser.getfloat(
+        "HEATMAP", "activation_percentile", fallback=0.98
+    )
+    activation_percentile = float(min(max(activation_percentile, 0.0), 1.0))
+    activation_min_value = parser.getfloat(
+        "HEATMAP", "activation_min_value", fallback=0.85
+    )
+    activation_min_value = float(min(max(activation_min_value, 0.0), 1.0))
+    heatmap_cfg = HeatmapConfig(
+        activation_percentile=activation_percentile,
+        activation_min_value=activation_min_value,
+    )
     cfg = AppConfig(
         model=model_cfg,
         data=data_cfg,
         output=output_cfg,
         infer=infer_cfg,
         result=result_cfg,
+        heatmap=heatmap_cfg,
     )
     notes.append(f"config_path={active_path}")
     return cfg, notes
@@ -729,12 +749,39 @@ def save_checkpoint(path: Path, model: Fastflow, threshold: float) -> None:
     torch.save({"state_dict": model.state_dict(), "threshold": threshold}, path)
 
 
+def load_checkpoint(path: Path, model: Fastflow) -> Optional[float]:
+    if not path.exists():
+        return None
+    state = torch.load(path, map_location="cpu")
+    if not isinstance(state, dict):
+        log(f"checkpoint_invalid path={path}")
+        return None
+    raw_state = state.get("state_dict", state)
+    if not isinstance(raw_state, dict):
+        log(f"checkpoint_invalid_state path={path}")
+        return None
+    missing, unexpected = model.load_state_dict(raw_state, strict=False)
+    if missing:
+        log(
+            f"checkpoint_missing_keys path={path} count={len(missing)} example={missing[0]}"
+        )
+    if unexpected:
+        log(
+            f"checkpoint_unexpected_keys path={path} count={len(unexpected)} example={unexpected[0]}"
+        )
+    threshold_value = state.get("threshold") if isinstance(state, dict) else None
+    if isinstance(threshold_value, (int, float)):
+        return float(threshold_value)
+    return None
+
+
 def save_heatmaps(
     model: Fastflow,
     dataloader,
     scores_by_path: dict[str, float],
     threshold: float,
     result_cfg: ResultConfig,
+    heatmap_cfg: HeatmapConfig,
 ) -> None:
     if not scores_by_path:
         return
@@ -801,8 +848,13 @@ def save_heatmaps(
                     image.save(out_dir / src_path.name)
                     continue
                 heat_norm = heat_2d / max_value
-                percentile_cut = np.quantile(heat_norm, 0.95)
-                dynamic_cut = max(0.6, percentile_cut)
+                percentile_cut = np.quantile(
+                    heat_norm,
+                    heatmap_cfg.activation_percentile
+                    if 0.0 <= heatmap_cfg.activation_percentile <= 1.0
+                    else 0.98,
+                )
+                dynamic_cut = max(heatmap_cfg.activation_min_value, percentile_cut)
                 heat_mask = np.where(heat_norm >= dynamic_cut, heat_norm, 0.0)
                 if heat_mask.max() <= 0:
                     image.save(out_dir / src_path.name)
@@ -841,21 +893,30 @@ def main() -> None:
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     checkpoint_dir = cfg.output.model_path.parent
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    trainer = Trainer(
-        max_epochs=cfg.model.num_epochs,
-        accelerator=accelerator,
-        devices=1,
-        logger=False,
-        enable_progress_bar=False,
-        enable_model_summary=False,
-        enable_checkpointing=False,
-        num_sanity_val_steps=0,
-        limit_val_batches=0,
-        callbacks=[EpochLogger()],
-    )
-    log("train_start")
-    trainer.fit(model=model, datamodule=datamodule)
-    log("train_complete")
+    checkpoint_path = cfg.output.model_path
+    loaded_threshold = load_checkpoint(checkpoint_path, model)
+    if checkpoint_path.exists():
+        log(
+            f"train_skip checkpoint_found={checkpoint_path}"
+        )
+        if loaded_threshold is not None:
+            log(f"checkpoint_threshold_loaded value={loaded_threshold:.6f}")
+    else:
+        trainer = Trainer(
+            max_epochs=cfg.model.num_epochs,
+            accelerator=accelerator,
+            devices=1,
+            logger=False,
+            enable_progress_bar=False,
+            enable_model_summary=False,
+            enable_checkpointing=False,
+            num_sanity_val_steps=0,
+            limit_val_batches=0,
+            callbacks=[EpochLogger()],
+        )
+        log("train_start")
+        trainer.fit(model=model, datamodule=datamodule)
+        log("train_complete")
     train_scores, train_labels, _ = compute_scores(
         model,
         datamodule.train_dataloader(),
@@ -881,7 +942,12 @@ def main() -> None:
         path: float(score) for path, score in zip(test_paths, test_scores)
     }
     save_heatmaps(
-        model, datamodule.test_dataloader(), scores_by_path, threshold, cfg.result
+        model,
+        datamodule.test_dataloader(),
+        scores_by_path,
+        threshold,
+        cfg.result,
+        cfg.heatmap,
     )
     save_checkpoint(cfg.output.model_path, model, threshold)
 
