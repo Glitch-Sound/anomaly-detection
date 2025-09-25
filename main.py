@@ -785,15 +785,25 @@ def save_heatmaps(
                 if score <= threshold:
                     image.save(out_dir / src_path.name)
                     continue
-                heat_2d = heat[0] if heat.ndim == 3 else heat
-                heat_2d = (-heat_2d).astype(np.float32)
-                if heat_2d.max() <= 0:
+                if heat.ndim == 3:
+                    heat_2d = np.amax(heat, axis=0)
+                else:
+                    heat_2d = heat
+                heat_2d = heat_2d.astype(np.float32)
+                finite_mask = np.isfinite(heat_2d)
+                if not finite_mask.any():
                     image.save(out_dir / src_path.name)
                     continue
-                heat_2d = np.where(heat_2d > 0.0, heat_2d, 0.0)
-                percentile_cut = np.quantile(heat_2d, 0.95)
-                dynamic_cut = max(heat_2d.max() * 0.6, percentile_cut)
-                heat_mask = np.where(heat_2d >= dynamic_cut, heat_2d, 0.0)
+                heat_2d = np.where(finite_mask, heat_2d, 0.0)
+                heat_2d -= heat_2d.min()
+                max_value = float(heat_2d.max())
+                if max_value <= 0.0:
+                    image.save(out_dir / src_path.name)
+                    continue
+                heat_norm = heat_2d / max_value
+                percentile_cut = np.quantile(heat_norm, 0.95)
+                dynamic_cut = max(0.6, percentile_cut)
+                heat_mask = np.where(heat_norm >= dynamic_cut, heat_norm, 0.0)
                 if heat_mask.max() <= 0:
                     image.save(out_dir / src_path.name)
                     continue
