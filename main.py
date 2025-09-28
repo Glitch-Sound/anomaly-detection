@@ -17,9 +17,11 @@ from anomalib.data import Folder
 from anomalib.models.image.fastflow import Fastflow
 from anomalib.models.image.fastflow.torch_model import create_fast_flow_block
 from anomalib.visualization import visualize_anomaly_map
+from lightning.fabric.utilities.exceptions import MisconfigurationException
 from lightning.pytorch import Callback, Trainer, seed_everything
 from PIL import Image
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from torchvision.transforms import v2 as T
 
 logging.getLogger("anomalib").setLevel(logging.ERROR)
 logging.getLogger("timm").setLevel(logging.ERROR)
@@ -188,12 +190,15 @@ class ModelConfig:
     lr_scheduler_factor: float
     lr_scheduler_patience: int
     lr_scheduler_min_lr: float
+    lr_scheduler_monitor: str
 
 
 @dataclass
 class DataConfig:
     train_dir: Path
     test_root: Path
+    val_split_ratio: float
+    num_workers: int
 
 
 @dataclass
@@ -299,13 +304,30 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
         lr_scheduler_min_lr=parser.getfloat(
             "MODEL", "lr_scheduler_min_lr", fallback=1e-6
         ),
+        lr_scheduler_monitor=parser.get(
+            "MODEL", "lr_scheduler_monitor", fallback="train_loss"
+        ).strip(),
     )
     data_cfg = DataConfig(
         train_dir=Path(
             parser.get("DATA", "train_data_path", fallback="data/train/good")
         ),
         test_root=Path(parser.get("DATA", "test_data_path", fallback="data/test")),
+        val_split_ratio=max(
+            0.0,
+            min(
+                0.5,
+                parser.getfloat("DATA", "val_split_ratio", fallback=0.1),
+            ),
+        ),
+        num_workers=max(0, parser.getint("DATA", "num_workers", fallback=0)),
     )
+    if (
+        data_cfg.val_split_ratio <= 0.0
+        and model_cfg.lr_scheduler_monitor.strip().lower() == "val_loss"
+    ):
+        model_cfg.lr_scheduler_monitor = "train_loss"
+        notes.append("lr_monitor_fallback=train_loss")
     output_cfg = OutputConfig(
         model_path=Path(
             parser.get("OUTPUT", "model_save_path", fallback="params/model.pth")
@@ -339,6 +361,8 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
         result=result_cfg,
         heatmap=heatmap_cfg,
     )
+    notes.append(f"val_split_ratio={data_cfg.val_split_ratio:.3f}")
+    notes.append(f"data_num_workers={data_cfg.num_workers}")
     notes.append(f"config_path={active_path}")
     return cfg, notes
 
@@ -364,6 +388,7 @@ def apply_learning_rate(model: Fastflow, cfg: ModelConfig) -> None:
         factor = max(min(cfg.lr_scheduler_factor, 0.999), 1e-6)
         patience = max(cfg.lr_scheduler_patience, 0)
         min_lr = max(cfg.lr_scheduler_min_lr, 0.0)
+        monitor_metric = cfg.lr_scheduler_monitor.strip() or "val_loss"
         if patience > 0 and 0.0 < factor < 1.0:
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
@@ -376,7 +401,7 @@ def apply_learning_rate(model: Fastflow, cfg: ModelConfig) -> None:
                 "optimizer": optimizer,
                 "lr_scheduler": {
                     "scheduler": scheduler,
-                    "monitor": "train_loss",
+                    "monitor": monitor_metric,
                     "interval": "epoch",
                     "frequency": 1,
                 },
@@ -396,20 +421,94 @@ def suppress_module_logging(model: Fastflow) -> None:
     model.log = types.MethodType(patched_log, model)
 
 
-def build_datamodule(cfg: AppConfig, transform) -> Folder:
-    dm = Folder(
+def build_transforms(cfg: AppConfig, pre_processor) -> Tuple[object, object]:
+    if not hasattr(pre_processor, "transform"):
+        raise AttributeError("pre_processor missing transform attribute")
+    base_transform = pre_processor.transform
+    if isinstance(base_transform, T.Compose):
+        base_ops = list(base_transform.transforms)
+    else:
+        base_ops = [base_transform]
+    train_ops = [
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomVerticalFlip(p=0.1),
+        T.RandomAffine(
+            degrees=15,
+            translate=(0.03, 0.03),
+            scale=(0.95, 1.05),
+            interpolation=T.InterpolationMode.BILINEAR,
+        ),
+        T.RandomApply(
+            [T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15, hue=0.05)],
+            p=0.3,
+        ),
+        T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))], p=0.2),
+    ] + base_ops
+    train_transform = T.Compose(train_ops)
+    eval_transform = base_transform
+    return train_transform, eval_transform
+
+
+def _assign_datamodule_transform(dm: Folder, split: str, transform) -> None:
+    attr_candidates = [f"{split}_transform", f"{split}_augmentations"]
+    for attr in attr_candidates:
+        if hasattr(dm, attr):
+            setattr(dm, attr, transform)
+    dataset = getattr(dm, f"{split}_dataset", None)
+    if dataset is not None:
+        if hasattr(dataset, "transform"):
+            dataset.transform = transform
+        if hasattr(dataset, "augmentations"):
+            dataset.augmentations = transform
+
+
+def build_datamodule(
+    cfg: AppConfig, train_transform, eval_transform, num_workers: int = 3
+) -> Folder:
+    dm_kwargs = dict(
         name="dataset",
         normal_dir=str(cfg.data.train_dir),
         normal_test_dir=str(cfg.data.test_root / "good"),
         abnormal_dir=str(cfg.data.test_root / "error"),
-        val_split_mode="none",
         train_batch_size=cfg.model.batch_size,
         eval_batch_size=cfg.model.batch_size,
-        num_workers=0,
-        augmentations=transform,
+        num_workers=num_workers,
+        augmentations=train_transform,
     )
+    if cfg.data.val_split_ratio > 0.0:
+        dm_kwargs["val_split_mode"] = "same_as_test"
+    else:
+        dm_kwargs["val_split_mode"] = "none"
+    try:
+        dm = Folder(**dm_kwargs)
+    except TypeError:
+        dm_kwargs.pop("val_split_ratio", None)
+        dm = Folder(**dm_kwargs)
     dm.setup()
+    _assign_datamodule_transform(dm, "train", train_transform)
+    for split in ("val", "test", "predict"):
+        _assign_datamodule_transform(dm, split, eval_transform)
     return dm
+
+
+def summarize_datamodule(dm: Folder) -> Tuple[int, int, int]:
+    train_size = len(dm.train_dataloader().dataset)
+
+    def _loader_size(loader) -> int:
+        if loader is None:
+            return 0
+        if isinstance(loader, list):
+            for item in loader:
+                size = _loader_size(item)
+                if size:
+                    return size
+            return 0
+        dataset = getattr(loader, "dataset", None)
+        return len(dataset) if dataset is not None else 0
+
+    val_size = _loader_size(dm.val_dataloader())
+    test_size = _loader_size(dm.test_dataloader())
+    return train_size, val_size, test_size
 
 
 def download_pretrained_weights(backbone: str, destination: Path) -> Path:
@@ -422,9 +521,7 @@ def download_pretrained_weights(backbone: str, destination: Path) -> Path:
     try:
         import timm
 
-        log(
-            f"weights_download_start backbone={backbone} target={destination}"
-        )
+        log(f"weights_download_start backbone={backbone} target={destination}")
         model = timm.create_model(backbone, pretrained=True)
         state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     except Exception as exc:  # pragma: no cover - depends on external availability
@@ -436,21 +533,15 @@ def download_pretrained_weights(backbone: str, destination: Path) -> Path:
             del model
         _restore_offline_env(saved_env)
     if state_dict is None:
-        raise RuntimeError(
-            f"unable to obtain pretrained weights for '{backbone}'"
-        )
+        raise RuntimeError(f"unable to obtain pretrained weights for '{backbone}'")
     torch.save(state_dict, destination)
-    log(
-        f"weights_download_complete backbone={backbone} saved={destination}"
-    )
+    log(f"weights_download_complete backbone={backbone} saved={destination}")
     return destination
 
 
 def locate_pretrained_weights(backbone: str, allow_download: bool = True) -> Path:
     if not MODELS_DIR.exists():
-        raise FileNotFoundError(
-            f"models directory missing. expected path={MODELS_DIR}"
-        )
+        raise FileNotFoundError(f"models directory missing. expected path={MODELS_DIR}")
     sanitized = _sanitize_backbone_name(backbone)
     candidates = [backbone, sanitized]
     exts = (".pth", ".pt", ".bin")
@@ -511,9 +602,7 @@ def load_local_pretrained_weights(model: Fastflow, cfg: ModelConfig) -> None:
             f"unexpected checkpoint format at {weights_path}. expected dict"
         )
     state_dict = _normalize_state_dict(state_object)
-    missing, unexpected = feature_extractor.load_state_dict(
-        state_dict, strict=False
-    )
+    missing, unexpected = feature_extractor.load_state_dict(state_dict, strict=False)
     log(f"weights_loaded backbone={cfg.backbone} source={weights_path}")
     if missing:
         log(f"weights_missing count={len(missing)} example={missing[0]}")
@@ -559,11 +648,31 @@ def configure_vit_layers(model: Fastflow, cfg: ModelConfig) -> None:
     total_blocks = len(blocks)
     if total_blocks == 0:
         return
+    requested_layers = list(cfg.vit_layers)
+    if not requested_layers:
+        requested_layers = [
+            max(1, total_blocks // 3),
+            max(1, (2 * total_blocks) // 3),
+            total_blocks,
+        ]
+    elif len(requested_layers) == 1:
+        layer = requested_layers[0]
+        requested_layers = sorted(
+            {
+                max(1, layer - 2),
+                layer,
+                min(total_blocks, layer + 2),
+                total_blocks,
+            }
+        )
     unique_layers = sorted(
-        {layer for layer in cfg.vit_layers if 1 <= layer <= total_blocks}
+        {layer for layer in requested_layers if 1 <= layer <= total_blocks}
     )
     if not unique_layers:
         return
+    if unique_layers != list(cfg.vit_layers):
+        log(f"vit_layers_adjusted requested={cfg.vit_layers} applied={unique_layers}")
+        cfg.vit_layers = unique_layers
 
     patch_embed = getattr(feature_extractor, "patch_embed", None)
     if patch_embed is None:
@@ -695,7 +804,16 @@ def compute_scores(
 def determine_threshold(train_scores: np.ndarray, epsilon: float) -> float:
     if train_scores.size == 0:
         return float(epsilon)
-    return float(train_scores.max() + epsilon)
+    finite_scores = train_scores[np.isfinite(train_scores)]
+    if finite_scores.size == 0:
+        return float(epsilon)
+    max_based = float(finite_scores.max() + epsilon)
+    quantile_based = float(np.quantile(finite_scores, 0.997))
+    mean_value = float(finite_scores.mean())
+    std_value = float(finite_scores.std())
+    gaussian_based = float(mean_value + 3.0 * std_value)
+    threshold = max(max_based, quantile_based, gaussian_based)
+    return float(max(threshold, epsilon))
 
 
 def adapt_threshold(
@@ -708,13 +826,37 @@ def adapt_threshold(
         return base_threshold
     mask_good = test_labels == 0
     mask_error = test_labels == 1
-    if not mask_good.any() or not mask_error.any():
+    valid_mask = (mask_good | mask_error) & np.isfinite(test_scores)
+    if not valid_mask.any():
         return base_threshold
-    good_max = float(test_scores[mask_good].max())
-    error_min = float(test_scores[mask_error].min())
-    if error_min > good_max:
-        return float((good_max + error_min) / 2)
-    return base_threshold
+    y_true = test_labels[valid_mask]
+    y_scores = test_scores[valid_mask]
+    candidates = np.unique(np.concatenate((y_scores, np.asarray([base_threshold]))))
+    if candidates.size > 512:
+        quantiles = np.linspace(0.0, 1.0, num=512)
+        candidates = np.unique(np.quantile(y_scores, quantiles))
+        candidates = np.concatenate((candidates, np.asarray([base_threshold])))
+        candidates = np.unique(candidates)
+    best_threshold = base_threshold
+    best_f1 = -1.0
+    best_youden = -1.0
+    for candidate in candidates:
+        preds = (y_scores > candidate).astype(int)
+        f1 = f1_score(y_true, preds, zero_division=0)
+        tp = float(((preds == 1) & (y_true == 1)).sum())
+        tn = float(((preds == 0) & (y_true == 0)).sum())
+        fp = float(((preds == 1) & (y_true == 0)).sum())
+        fn = float(((preds == 0) & (y_true == 1)).sum())
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+        youden = tpr - fpr
+        if (f1 > best_f1 + 1e-6) or (
+            abs(f1 - best_f1) <= 1e-6 and youden > best_youden + 1e-6
+        ):
+            best_threshold = float(candidate)
+            best_f1 = f1
+            best_youden = youden
+    return float(max(best_threshold, epsilon))
 
 
 def evaluate_predictions(
@@ -883,11 +1025,27 @@ def main() -> None:
     pre_processor = Fastflow.configure_pre_processor(
         image_size=(cfg.model.input_size, cfg.model.input_size)
     )
-    datamodule = build_datamodule(cfg, pre_processor.transform)
-    train_dataset_size = len(datamodule.train_dataloader().dataset)
-    test_dataset_size = len(datamodule.test_dataloader().dataset)
-    log(
-        f"dataset_summary train_samples={train_dataset_size} test_samples={test_dataset_size}"
+    train_transform, eval_transform = build_transforms(cfg, pre_processor)
+    def prepare_datamodule(worker_count: int) -> Folder:
+        return build_datamodule(
+            cfg, train_transform, eval_transform, num_workers=worker_count
+        )
+
+    def log_dataset_stats(dm: Folder, worker_count: int) -> Tuple[int, int, int]:
+        train_samples, val_samples, test_samples = summarize_datamodule(dm)
+        log(
+            "dataset_summary "
+            f"train_samples={train_samples} "
+            f"val_samples={val_samples} "
+            f"test_samples={test_samples} "
+            f"num_workers={worker_count}"
+        )
+        return train_samples, val_samples, test_samples
+
+    requested_workers = cfg.data.num_workers
+    datamodule = prepare_datamodule(requested_workers)
+    train_dataset_size, val_dataset_size, test_dataset_size = log_dataset_stats(
+        datamodule, requested_workers
     )
     model = build_model(cfg, pre_processor)
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
@@ -895,28 +1053,67 @@ def main() -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = cfg.output.model_path
     loaded_threshold = load_checkpoint(checkpoint_path, model)
+    trainer_kwargs = dict(
+        max_epochs=cfg.model.num_epochs,
+        accelerator=accelerator,
+        devices=1,
+        logger=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        enable_checkpointing=False,
+        num_sanity_val_steps=0,
+        callbacks=[EpochLogger()],
+        check_val_every_n_epoch=1,
+    )
+
+    def run_training(dm: Folder, worker_count: int) -> None:
+        trainer = Trainer(**trainer_kwargs)
+        log(f"train_start num_workers={worker_count}")
+        trainer.fit(model=model, datamodule=dm)
+        log("train_complete")
+
     if checkpoint_path.exists():
-        log(
-            f"train_skip checkpoint_found={checkpoint_path}"
-        )
+        log(f"train_skip checkpoint_found={checkpoint_path}")
         if loaded_threshold is not None:
             log(f"checkpoint_threshold_loaded value={loaded_threshold:.6f}")
     else:
-        trainer = Trainer(
-            max_epochs=cfg.model.num_epochs,
-            accelerator=accelerator,
-            devices=1,
-            logger=False,
-            enable_progress_bar=False,
-            enable_model_summary=False,
-            enable_checkpointing=False,
-            num_sanity_val_steps=0,
-            limit_val_batches=0,
-            callbacks=[EpochLogger()],
-        )
-        log("train_start")
-        trainer.fit(model=model, datamodule=datamodule)
-        log("train_complete")
+        while True:
+            try:
+                run_training(datamodule, requested_workers)
+                break
+            except MisconfigurationException as exc:
+                message = str(exc).lower()
+                missing_metric = "conditioned on metric" in message
+                if (
+                    missing_metric
+                    and cfg.model.lr_scheduler_monitor.lower() != "train_loss"
+                ):
+                    log(
+                        "train_retry reason=missing_monitor "
+                        "fallback_monitor=train_loss"
+                    )
+                    cfg.model.lr_scheduler_monitor = "train_loss"
+                    apply_learning_rate(model, cfg.model)
+                    continue
+                raise
+            except (PermissionError, RuntimeError) as exc:
+                message = str(exc).lower()
+                permission_issue = isinstance(exc, PermissionError) or any(
+                    token in message for token in ("semlock", "please call `iter` first")
+                )
+                if requested_workers > 0 and permission_issue:
+                    log(
+                        "train_retry reason=multiprocessing_unavailable "
+                        "fallback_num_workers=0"
+                    )
+                    requested_workers = 0
+                    cfg.data.num_workers = 0
+                    datamodule = prepare_datamodule(requested_workers)
+                    train_dataset_size, val_dataset_size, test_dataset_size = (
+                        log_dataset_stats(datamodule, requested_workers)
+                    )
+                    continue
+                raise
     train_scores, train_labels, _ = compute_scores(
         model,
         datamodule.train_dataloader(),
