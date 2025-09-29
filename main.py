@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -222,6 +223,11 @@ class ResultConfig:
 class HeatmapConfig:
     activation_percentile: float
     activation_min_value: float
+    blur_kernel_size: int
+    blur_sigma: float
+    normalize_clip_percentile: float
+    normalize_clip_lower_percentile: float
+    resize_to_input_size: bool
 
 
 @dataclass
@@ -349,9 +355,40 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
         "HEATMAP", "activation_min_value", fallback=0.85
     )
     activation_min_value = float(min(max(activation_min_value, 0.0), 1.0))
+    blur_kernel_size = max(0, parser.getint("HEATMAP", "blur_kernel_size", fallback=5))
+    if blur_kernel_size % 2 == 0 and blur_kernel_size != 0:
+        blur_kernel_size += 1
+    blur_sigma = max(0.0, parser.getfloat("HEATMAP", "blur_sigma", fallback=1.0))
+    normalize_clip_percentile = float(
+        min(
+            max(parser.getfloat("HEATMAP", "normalize_clip_percentile", fallback=0.99), 0.0),
+            1.0,
+        )
+    )
+    normalize_clip_lower_percentile = float(
+        min(
+            max(
+                parser.getfloat(
+                    "HEATMAP", "normalize_clip_lower_percentile", fallback=0.0
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+    )
+    if normalize_clip_lower_percentile > normalize_clip_percentile:
+        normalize_clip_lower_percentile = normalize_clip_percentile
+    resize_to_input_size = parser.getboolean(
+        "HEATMAP", "resize_to_input_size", fallback=True
+    )
     heatmap_cfg = HeatmapConfig(
         activation_percentile=activation_percentile,
         activation_min_value=activation_min_value,
+        blur_kernel_size=blur_kernel_size,
+        blur_sigma=blur_sigma,
+        normalize_clip_percentile=normalize_clip_percentile,
+        normalize_clip_lower_percentile=normalize_clip_lower_percentile,
+        resize_to_input_size=resize_to_input_size,
     )
     cfg = AppConfig(
         model=model_cfg,
@@ -473,6 +510,7 @@ def build_datamodule(
         train_batch_size=cfg.model.batch_size,
         eval_batch_size=cfg.model.batch_size,
         num_workers=num_workers,
+        val_split_ratio=cfg.data.val_split_ratio,
         augmentations=train_transform,
     )
     if cfg.data.val_split_ratio > 0.0:
@@ -924,6 +962,7 @@ def save_heatmaps(
     threshold: float,
     result_cfg: ResultConfig,
     heatmap_cfg: HeatmapConfig,
+    input_size: int,
 ) -> None:
     if not scores_by_path:
         return
@@ -979,41 +1018,94 @@ def save_heatmaps(
                 else:
                     heat_2d = heat
                 heat_2d = heat_2d.astype(np.float32)
+                if (
+                    heatmap_cfg.blur_kernel_size >= 3
+                    and heatmap_cfg.blur_kernel_size % 2 == 1
+                ):
+                    heat_2d = cv2.GaussianBlur(
+                        heat_2d,
+                        (heatmap_cfg.blur_kernel_size, heatmap_cfg.blur_kernel_size),
+                        heatmap_cfg.blur_sigma,
+                    )
                 finite_mask = np.isfinite(heat_2d)
                 if not finite_mask.any():
                     image.save(out_dir / src_path.name)
                     continue
                 heat_2d = np.where(finite_mask, heat_2d, 0.0)
-                heat_2d -= heat_2d.min()
-                max_value = float(heat_2d.max())
-                if max_value <= 0.0:
+                heat_values = heat_2d[finite_mask]
+                lower_pct = heatmap_cfg.normalize_clip_lower_percentile
+                upper_pct = heatmap_cfg.normalize_clip_percentile
+                if 0.0 < upper_pct <= 1.0:
+                    upper_value = float(np.quantile(heat_values, upper_pct))
+                    heat_2d = np.minimum(heat_2d, upper_value)
+                if 0.0 < lower_pct < 1.0:
+                    lower_value = float(np.quantile(heat_values, lower_pct))
+                    heat_2d = np.maximum(heat_2d, lower_value)
+                heat_values = heat_2d[np.isfinite(heat_2d)]
+                if heat_values.size == 0:
                     image.save(out_dir / src_path.name)
                     continue
-                heat_norm = heat_2d / max_value
-                percentile_cut = np.quantile(
-                    heat_norm,
+                min_value = float(heat_values.min())
+                max_value = float(heat_values.max())
+                if not np.isfinite(max_value) or max_value <= min_value:
+                    image.save(out_dir / src_path.name)
+                    continue
+                heat_norm = (heat_2d - min_value) / (max_value - min_value)
+                percentile_source = (
                     heatmap_cfg.activation_percentile
                     if 0.0 <= heatmap_cfg.activation_percentile <= 1.0
-                    else 0.98,
+                    else 0.98
                 )
+                percentile_cut = float(np.quantile(heat_norm, percentile_source))
                 dynamic_cut = max(heatmap_cfg.activation_min_value, percentile_cut)
-                heat_mask = np.where(heat_norm >= dynamic_cut, heat_norm, 0.0)
+                if dynamic_cut <= 0.0:
+                    heat_mask = heat_norm
+                else:
+                    heat_mask = np.where(heat_norm >= dynamic_cut, heat_norm, 0.0)
                 if heat_mask.max() <= 0:
                     image.save(out_dir / src_path.name)
                     continue
-                heat_map_image = visualize_anomaly_map(
+                heat_map_raw = visualize_anomaly_map(
                     heat_mask, normalize=True, colormap=True
                 )
+                if isinstance(heat_map_raw, Image.Image):
+                    heat_map_image = heat_map_raw.convert("RGB")
+                else:
+                    heat_map_array: Optional[np.ndarray] = None
+                    if isinstance(heat_map_raw, np.ndarray):
+                        heat_map_array = heat_map_raw
+                    elif torch.is_tensor(heat_map_raw):
+                        heat_map_array = heat_map_raw.detach().cpu().numpy()
+                    if heat_map_array is None:
+                        raise TypeError(
+                            "visualize_anomaly_map returned unsupported type"
+                        )
+                    if heat_map_array.dtype != np.uint8:
+                        finite_values = heat_map_array[np.isfinite(heat_map_array)]
+                        finite_max = float(finite_values.max()) if finite_values.size else 0.0
+                        if finite_max <= 1.0:
+                            heat_map_array = np.clip(heat_map_array * 255.0, 0, 255)
+                        else:
+                            heat_map_array = np.clip(heat_map_array, 0, 255)
+                        heat_map_array = heat_map_array.astype(np.uint8)
+                    heat_map_image = Image.fromarray(heat_map_array)
+                base_image = image
+                original_size = image.size
+                if heatmap_cfg.resize_to_input_size and input_size > 0:
+                    target_size = (int(input_size), int(input_size))
+                    base_image = image.resize(target_size, resample=Image.BILINEAR)
                 heat_map_image = heat_map_image.resize(
-                    image.size, resample=Image.BILINEAR
+                    base_image.size, resample=Image.BILINEAR
                 )
-                overlay = Image.blend(image, heat_map_image, alpha=0.5)
+                overlay = Image.blend(base_image, heat_map_image, alpha=0.5)
+                if heatmap_cfg.resize_to_input_size and input_size > 0:
+                    overlay = overlay.resize(original_size, resample=Image.BILINEAR)
                 overlay.save(out_dir / src_path.name)
         log(f"heatmap_stage batch={index + 1}/{total}")
 
 
 def main() -> None:
-    seed_everything(42, workers=True, verbose=False)
+    seed_everything(42, workers=True)
     cfg, notes = load_config()
     log(f"config_model {asdict(cfg.model)}")
     log(f"config_data {asdict(cfg.data)}")
@@ -1026,6 +1118,7 @@ def main() -> None:
         image_size=(cfg.model.input_size, cfg.model.input_size)
     )
     train_transform, eval_transform = build_transforms(cfg, pre_processor)
+
     def prepare_datamodule(worker_count: int) -> Folder:
         return build_datamodule(
             cfg, train_transform, eval_transform, num_workers=worker_count
@@ -1089,8 +1182,7 @@ def main() -> None:
                     and cfg.model.lr_scheduler_monitor.lower() != "train_loss"
                 ):
                     log(
-                        "train_retry reason=missing_monitor "
-                        "fallback_monitor=train_loss"
+                        "train_retry reason=missing_monitor fallback_monitor=train_loss"
                     )
                     cfg.model.lr_scheduler_monitor = "train_loss"
                     apply_learning_rate(model, cfg.model)
@@ -1099,7 +1191,8 @@ def main() -> None:
             except (PermissionError, RuntimeError) as exc:
                 message = str(exc).lower()
                 permission_issue = isinstance(exc, PermissionError) or any(
-                    token in message for token in ("semlock", "please call `iter` first")
+                    token in message
+                    for token in ("semlock", "please call `iter` first")
                 )
                 if requested_workers > 0 and permission_issue:
                     log(
@@ -1145,6 +1238,7 @@ def main() -> None:
         threshold,
         cfg.result,
         cfg.heatmap,
+        cfg.model.input_size,
     )
     save_checkpoint(cfg.output.model_path, model, threshold)
 
