@@ -361,7 +361,10 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
     blur_sigma = max(0.0, parser.getfloat("HEATMAP", "blur_sigma", fallback=1.0))
     normalize_clip_percentile = float(
         min(
-            max(parser.getfloat("HEATMAP", "normalize_clip_percentile", fallback=0.99), 0.0),
+            max(
+                parser.getfloat("HEATMAP", "normalize_clip_percentile", fallback=0.99),
+                0.0,
+            ),
             1.0,
         )
     )
@@ -1082,7 +1085,9 @@ def save_heatmaps(
                         )
                     if heat_map_array.dtype != np.uint8:
                         finite_values = heat_map_array[np.isfinite(heat_map_array)]
-                        finite_max = float(finite_values.max()) if finite_values.size else 0.0
+                        finite_max = (
+                            float(finite_values.max()) if finite_values.size else 0.0
+                        )
                         if finite_max <= 1.0:
                             heat_map_array = np.clip(heat_map_array * 255.0, 0, 255)
                         else:
@@ -1227,6 +1232,8 @@ def main() -> None:
     )
     log(f"threshold_base={base_threshold:.6f}")
     log(f"threshold_final={threshold:.6f}")
+    save_checkpoint(cfg.output.model_path, model, threshold)
+
     evaluate_predictions(test_scores, test_labels, test_paths, threshold)
     scores_by_path = {
         path: float(score) for path, score in zip(test_paths, test_scores)
@@ -1240,7 +1247,6 @@ def main() -> None:
         cfg.heatmap,
         cfg.model.input_size,
     )
-    save_checkpoint(cfg.output.model_path, model, threshold)
 
 
 if __name__ == "__main__":
