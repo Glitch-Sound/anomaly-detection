@@ -43,25 +43,32 @@ OFFLINE_ENV_VARS = (
 
 
 def _disable_offline_env() -> dict:
+    # オフライン用の環境変数を退避して一時的に無効化する
     saved = {}
     for key in OFFLINE_ENV_VARS:
+        # 現在の値を記録し、環境変数から取り除く
         saved[key] = os.environ.pop(key, None)
     return saved
 
 
 def _restore_offline_env(saved: dict) -> None:
+    # 退避しておいた環境変数を元に戻す
     for key, value in saved.items():
         if value is not None:
+            # 削除前の値がある場合だけ環境変数に再設定する
             os.environ[key] = value
 
 
 def _sanitize_backbone_name(backbone: str) -> str:
+    # モデル名にスラッシュが含まれる場合にファイル名向けに置き換える
     return backbone.replace("/", "_")
 
 
 def configure_offline_environment(models_dir: Path) -> None:
+    # 学習で使用する各種キャッシュディレクトリを指定し、オフライン動作に備える
     models_dir.mkdir(parents=True, exist_ok=True)
     resolved = str(models_dir)
+    # 主要なライブラリのキャッシュ先を同じディレクトリに集約する
     os.environ.setdefault("TORCH_HOME", resolved)
     os.environ.setdefault("TIMM_HOME", resolved)
     os.environ.setdefault("HF_HOME", resolved)
@@ -75,21 +82,26 @@ configure_offline_environment(MODELS_DIR)
 
 
 def log(message: str) -> None:
+    # 標準出力にログメッセージをそのまま表示する
     print(message)
 
 
 def parse_int_list(value: str) -> List[int]:
+    # コンマ区切りの文字列を整数リストへ変換する
     tokens = [t.strip() for t in value.split(",") if t.strip()]
     result: List[int] = []
     for token in tokens:
         try:
+            # 整数に変換できた値のみ結果へ追加する
             result.append(int(token))
         except ValueError:
+            # 数値以外は無視して処理を続行する
             continue
     return result
 
 
 def _fastflow_forward_two_outputs(self, *args, **kwargs):
+    # Fastflow の forward が2つのテンソルを返すようにラップする
     original = getattr(self, "_ff_original_forward", None)
     if original is None:
         original = self.__class__.forward
@@ -100,12 +112,14 @@ def _fastflow_forward_two_outputs(self, *args, **kwargs):
         if len(output) >= 2:
             hidden_variables, jacobians = output[0], output[1]
             if hidden_variables is None or jacobians is None:
+                # 期待するテンソルが欠落している場合は異常終了させる
                 raise RuntimeError("fastflow forward returned None")
             return hidden_variables, jacobians
     return output
 
 
 def _fastflow_get_vit_features(self, input_tensor: torch.Tensor) -> List[torch.Tensor]:
+    # 指定された層の特徴マップを Vision Transformer から取り出す
     layer_set = getattr(self, "_ff_vit_layer_set", None)
     if not layer_set:
         original = getattr(self, "_ff_original_get_vit_features", None)
@@ -120,6 +134,7 @@ def _fastflow_get_vit_features(self, input_tensor: torch.Tensor) -> List[torch.T
     tokens_to_concat: List[torch.Tensor] = []
     cls_token = getattr(self.feature_extractor, "cls_token", None)
     if cls_token is not None:
+        # cls / dist トークンを先頭に結合して標準のトークン列に揃える
         tokens_to_concat.append(cls_token.expand(feature.shape[0], -1, -1))
     dist_token = getattr(self.feature_extractor, "dist_token", None)
     if dist_token is not None:
@@ -131,6 +146,7 @@ def _fastflow_get_vit_features(self, input_tensor: torch.Tensor) -> List[torch.T
     )
     outputs: List[torch.Tensor] = []
     for idx, block in enumerate(self.feature_extractor.blocks, start=1):
+        # 各ブロックを順次適用し、指定層で特徴マップを保存する
         feature = block(feature)
         if idx in layer_set:
             normed = self.feature_extractor.norm(feature)
@@ -143,6 +159,7 @@ def _fastflow_get_vit_features(self, input_tensor: torch.Tensor) -> List[torch.T
                 if side * side == num_tokens:
                     target_h = target_w = side
                 else:
+                    # 正方形に並べ替えできない場合は処理を打ち切る
                     raise RuntimeError("unable to infer spatial size from tokens")
             try:
                 tokens = tokens.reshape(batch_size, channels, target_h, target_w)
@@ -154,6 +171,7 @@ def _fastflow_get_vit_features(self, input_tensor: torch.Tensor) -> List[torch.T
                     raise
             outputs.append(tokens)
     if not outputs:
+        # 目的の層が取得できなかった場合は最終層を返す
         normed = self.feature_extractor.norm(feature)
         tokens = normed[:, special_tokens:, :]
         batch_size, num_tokens, channels = tokens.shape
@@ -242,9 +260,11 @@ class AppConfig:
 
 class EpochLogger(Callback):
     def on_train_epoch_end(self, trainer: Trainer, pl_module: Fastflow) -> None:
+        # 各エポック終了時に損失などの進捗をログへ流す
         metric = trainer.callback_metrics.get("train_loss")
         value = None
         if isinstance(metric, torch.Tensor):
+            # Tensor のままでは扱いづらいので CPU へ取り出して数値化する
             value = float(metric.detach().cpu().item())
         elif metric is not None:
             value = float(metric)
@@ -255,6 +275,7 @@ class EpochLogger(Callback):
 
 
 def resolve_backbone(requested: str) -> Tuple[str, int]:
+    # 利用可能なバックボーン名と推奨入力サイズを決定する
     supported = {
         "resnet18": 224,
         "wide_resnet50_2": 224,
@@ -265,6 +286,7 @@ def resolve_backbone(requested: str) -> Tuple[str, int]:
         return requested, supported[requested]
     lowered = requested.lower()
     if lowered.startswith("vit_"):
+        # 末尾の細かい違いは無視して汎用的な DeiT バリエーションへ誘導する
         return "deit_base_distilled_patch16_384", 384
     if lowered.startswith("wide_resnet50"):
         return "wide_resnet50_2", 224
@@ -272,6 +294,7 @@ def resolve_backbone(requested: str) -> Tuple[str, int]:
 
 
 def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
+    # 設定ファイルを読み込み、アプリケーション設定と注意事項をまとめて返す
     parser = configparser.ConfigParser()
     files = parser.read(path, encoding="utf-8")
     active_path = path
@@ -286,6 +309,7 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
     input_size = parser.getint("MODEL", "input_size", fallback=recommended_size)
     notes: List[str] = []
     if backbone != raw_backbone:
+        # 推奨と異なる指定があった場合は補正内容を記録する
         notes.append(f"backbone_replaced from={raw_backbone} to={backbone}")
     if input_size != recommended_size:
         notes.append(f"input_size_adjusted from={input_size} to={recommended_size}")
@@ -332,6 +356,7 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
         data_cfg.val_split_ratio <= 0.0
         and model_cfg.lr_scheduler_monitor.strip().lower() == "val_loss"
     ):
+        # 検証データが無い場合は監視対象を train_loss に切り替える
         model_cfg.lr_scheduler_monitor = "train_loss"
         notes.append("lr_monitor_fallback=train_loss")
     output_cfg = OutputConfig(
@@ -357,6 +382,7 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
     activation_min_value = float(min(max(activation_min_value, 0.0), 1.0))
     blur_kernel_size = max(0, parser.getint("HEATMAP", "blur_kernel_size", fallback=5))
     if blur_kernel_size % 2 == 0 and blur_kernel_size != 0:
+        # 偶数カーネルはガウシアンブラーで扱いづらいため奇数へ調整する
         blur_kernel_size += 1
     blur_sigma = max(0.0, parser.getfloat("HEATMAP", "blur_sigma", fallback=1.0))
     normalize_clip_percentile = float(
@@ -380,6 +406,7 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
         )
     )
     if normalize_clip_lower_percentile > normalize_clip_percentile:
+        # 上限より下限が大きい場合は上限に揃える
         normalize_clip_lower_percentile = normalize_clip_percentile
     resize_to_input_size = parser.getboolean(
         "HEATMAP", "resize_to_input_size", fallback=True
@@ -408,6 +435,7 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
 
 
 def ensure_two_output_forward(model: Fastflow) -> None:
+    # Fastflow の内部 forward をラップして潜在表現とヤコビアンを取得できるようにする
     if not hasattr(model, "model"):
         return
     inner = model.model
@@ -415,13 +443,16 @@ def ensure_two_output_forward(model: Fastflow) -> None:
         return
     original_forward = getattr(inner.__class__, "forward", None)
     if original_forward is not None:
+        # 差し替え後に元の forward を呼び出せるよう参照を記録する
         setattr(inner, "_ff_original_forward", original_forward)
     inner.forward = types.MethodType(_fastflow_forward_two_outputs, inner)
     setattr(inner, "_ff_two_output_patched", True)
 
 
 def apply_learning_rate(model: Fastflow, cfg: ModelConfig) -> None:
+    # Optimizer と LR スケジューラを設定するためのメソッドを差し替える
     def configure(self: Fastflow):
+        # Adam をベースに学習率とスケジューラを組み立てる
         optimizer = torch.optim.Adam(
             params=self.model.parameters(), lr=cfg.learning_rate, weight_decay=1e-5
         )
@@ -430,6 +461,7 @@ def apply_learning_rate(model: Fastflow, cfg: ModelConfig) -> None:
         min_lr = max(cfg.lr_scheduler_min_lr, 0.0)
         monitor_metric = cfg.lr_scheduler_monitor.strip() or "val_loss"
         if patience > 0 and 0.0 < factor < 1.0:
+            # ReduceLROnPlateau を使用して損失が改善しない場合に学習率を下げる
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
                 mode="min",
@@ -452,9 +484,11 @@ def apply_learning_rate(model: Fastflow, cfg: ModelConfig) -> None:
 
 
 def suppress_module_logging(model: Fastflow) -> None:
+    # Lightning へのログ送信を抑制し CLI への出力に集中させる
     original_log = model.log
 
     def patched_log(self: Fastflow, name, value, *args, **kwargs):
+        # logger=False を強制して外部ロガーへの送信を無効化する
         kwargs["logger"] = False
         return original_log(name, value, *args, **kwargs)
 
@@ -462,6 +496,7 @@ def suppress_module_logging(model: Fastflow) -> None:
 
 
 def build_transforms(cfg: AppConfig, pre_processor) -> Tuple[object, object]:
+    # 学習用と評価用の前処理パイプラインを構築する
     if not hasattr(pre_processor, "transform"):
         raise AttributeError("pre_processor missing transform attribute")
     base_transform = pre_processor.transform
@@ -469,6 +504,7 @@ def build_transforms(cfg: AppConfig, pre_processor) -> Tuple[object, object]:
         base_ops = list(base_transform.transforms)
     else:
         base_ops = [base_transform]
+    # 基本の前処理に軽めのデータ拡張を追加する
     train_ops = [
         T.RandomHorizontalFlip(p=0.5),
         T.RandomVerticalFlip(p=0.1),
@@ -490,6 +526,7 @@ def build_transforms(cfg: AppConfig, pre_processor) -> Tuple[object, object]:
 
 
 def _assign_datamodule_transform(dm: Folder, split: str, transform) -> None:
+    # 指定したデータ分割に対して変換処理を適用できるよう属性を更新する
     attr_candidates = [f"{split}_transform", f"{split}_augmentations"]
     for attr in attr_candidates:
         if hasattr(dm, attr):
@@ -497,6 +534,7 @@ def _assign_datamodule_transform(dm: Folder, split: str, transform) -> None:
     dataset = getattr(dm, f"{split}_dataset", None)
     if dataset is not None:
         if hasattr(dataset, "transform"):
+            # データセット側にも直接 transform を反映する
             dataset.transform = transform
         if hasattr(dataset, "augmentations"):
             dataset.augmentations = transform
@@ -505,6 +543,7 @@ def _assign_datamodule_transform(dm: Folder, split: str, transform) -> None:
 def build_datamodule(
     cfg: AppConfig, train_transform, eval_transform, num_workers: int = 3
 ) -> Folder:
+    # anomalib の Folder データモジュールを設定値に従って初期化する
     dm_kwargs = dict(
         name="dataset",
         normal_dir=str(cfg.data.train_dir),
@@ -517,31 +556,37 @@ def build_datamodule(
         augmentations=train_transform,
     )
     if cfg.data.val_split_ratio > 0.0:
+        # 検証データを確保する場合はテストと同じ分割方法を使用する
         dm_kwargs["val_split_mode"] = "same_as_test"
     else:
         dm_kwargs["val_split_mode"] = "none"
     try:
         dm = Folder(**dm_kwargs)
     except TypeError:
+        # 古い anomalib では val_split_ratio が存在しないため取り除いて再試行する
         dm_kwargs.pop("val_split_ratio", None)
         dm = Folder(**dm_kwargs)
     dm.setup()
     _assign_datamodule_transform(dm, "train", train_transform)
     for split in ("val", "test", "predict"):
+        # 評価系のデータには評価用変換を一括で適用する
         _assign_datamodule_transform(dm, split, eval_transform)
     return dm
 
 
 def summarize_datamodule(dm: Folder) -> Tuple[int, int, int]:
+    # データモジュールの各分割に含まれるサンプル数を取得する
     train_size = len(dm.train_dataloader().dataset)
 
     def _loader_size(loader) -> int:
+        # DataLoader またはリストで渡される場合に対応してサイズを計算する
         if loader is None:
             return 0
         if isinstance(loader, list):
             for item in loader:
                 size = _loader_size(item)
                 if size:
+                    # 最初にサイズが得られたローダーを採用する
                     return size
             return 0
         dataset = getattr(loader, "dataset", None)
@@ -553,6 +598,7 @@ def summarize_datamodule(dm: Folder) -> Tuple[int, int, int]:
 
 
 def download_pretrained_weights(backbone: str, destination: Path) -> Path:
+    # timm から学習済み重みを取得しローカルに保存する
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         return destination
@@ -564,6 +610,7 @@ def download_pretrained_weights(backbone: str, destination: Path) -> Path:
 
         log(f"weights_download_start backbone={backbone} target={destination}")
         model = timm.create_model(backbone, pretrained=True)
+        # GPU 非依存にするためテンソルを CPU 上の state_dict に変換する
         state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     except Exception as exc:  # pragma: no cover - depends on external availability
         raise RuntimeError(
@@ -581,6 +628,7 @@ def download_pretrained_weights(backbone: str, destination: Path) -> Path:
 
 
 def locate_pretrained_weights(backbone: str, allow_download: bool = True) -> Path:
+    # 既存の重みファイルを検索し、必要ならばダウンロードを実行する
     if not MODELS_DIR.exists():
         raise FileNotFoundError(f"models directory missing. expected path={MODELS_DIR}")
     sanitized = _sanitize_backbone_name(backbone)
@@ -590,6 +638,7 @@ def locate_pretrained_weights(backbone: str, allow_download: bool = True) -> Pat
         for ext in exts:
             candidate = MODELS_DIR / f"{name}{ext}"
             if candidate.exists():
+                # 候補名と拡張子の組み合わせで直接一致したファイルを優先する
                 return candidate
     matches = []
     for path in sorted(MODELS_DIR.glob("*")):
@@ -599,6 +648,7 @@ def locate_pretrained_weights(backbone: str, allow_download: bool = True) -> Pat
         if any(token in stem for token in candidates):
             matches.append(path)
     if matches:
+        # 部分一致でも候補があれば最初のものを返す
         return matches[0]
     if allow_download:
         downloaded = download_pretrained_weights(
@@ -612,6 +662,7 @@ def locate_pretrained_weights(backbone: str, allow_download: bool = True) -> Pat
 
 
 def _normalize_state_dict(raw_state: dict) -> dict:
+    # チェックポイント内のキー名を Fastflow の読み込みに合わせて整形する
     state = raw_state
     if "state_dict" in state and isinstance(state["state_dict"], dict):
         state = state["state_dict"]
@@ -626,11 +677,13 @@ def _normalize_state_dict(raw_state: dict) -> dict:
             new_key = new_key[len("model.") :]
         if new_key.startswith("backbone."):
             new_key = new_key[len("backbone.") :]
+        # 余計なプレフィックスを取り除きシンプルなキーに整形する
         cleaned[new_key] = value
     return cleaned
 
 
 def load_local_pretrained_weights(model: Fastflow, cfg: ModelConfig) -> None:
+    # 保存済みのバックボーン重みを Fastflow の特徴抽出器へ読み込む
     if not hasattr(model, "model"):
         return
     feature_extractor = getattr(model.model, "feature_extractor", None)
@@ -646,12 +699,14 @@ def load_local_pretrained_weights(model: Fastflow, cfg: ModelConfig) -> None:
     missing, unexpected = feature_extractor.load_state_dict(state_dict, strict=False)
     log(f"weights_loaded backbone={cfg.backbone} source={weights_path}")
     if missing:
+        # 読み込みできなかったキーは通知だけ行い学習は続行する
         log(f"weights_missing count={len(missing)} example={missing[0]}")
     if unexpected:
         log(f"weights_unexpected count={len(unexpected)} example={unexpected[0]}")
 
 
 def build_model(cfg: AppConfig, pre_processor) -> Fastflow:
+    # Fastflow モデルを構築し、必要なパッチや重みを適用する
     model = Fastflow(
         backbone=cfg.model.backbone,
         pre_trained=False,
@@ -663,6 +718,7 @@ def build_model(cfg: AppConfig, pre_processor) -> Fastflow:
         evaluator=False,
         visualizer=False,
     )
+    # 推論で追加情報を得られるよう各種パッチと重みを適用する
     ensure_two_output_forward(model)
     apply_learning_rate(model, cfg.model)
     suppress_module_logging(model)
@@ -672,6 +728,7 @@ def build_model(cfg: AppConfig, pre_processor) -> Fastflow:
 
 
 def configure_vit_layers(model: Fastflow, cfg: ModelConfig) -> None:
+    # ViT 系バックボーンで使用する層を調整し FastFlow ブロックを再構成する
     if not cfg.vit_layers:
         return
     backbone = cfg.backbone.lower()
@@ -712,6 +769,7 @@ def configure_vit_layers(model: Fastflow, cfg: ModelConfig) -> None:
     if not unique_layers:
         return
     if unique_layers != list(cfg.vit_layers):
+        # 実際に利用可能な層に合わせて設定を更新する
         log(f"vit_layers_adjusted requested={cfg.vit_layers} applied={unique_layers}")
         cfg.vit_layers = unique_layers
 
@@ -719,6 +777,7 @@ def configure_vit_layers(model: Fastflow, cfg: ModelConfig) -> None:
     if patch_embed is None:
         return
     patch_size_raw = getattr(patch_embed, "patch_size", (16, 16))
+    # パッチサイズ情報を整数に揃えて後段の空間サイズ計算に使う
     if isinstance(patch_size_raw, (tuple, list)):
         patch_h = int(patch_size_raw[0])
         patch_w = int(patch_size_raw[1 if len(patch_size_raw) > 1 else 0])
@@ -730,6 +789,7 @@ def configure_vit_layers(model: Fastflow, cfg: ModelConfig) -> None:
     grid_size = getattr(patch_embed, "grid_size", None)
     spatial_h = spatial_w = None
     if isinstance(grid_size, (tuple, list)) and len(grid_size) == 2:
+        # timm がグリッドサイズを保持している場合はその値を優先する
         spatial_h = int(grid_size[0])
         spatial_w = int(grid_size[1])
 
@@ -741,6 +801,7 @@ def configure_vit_layers(model: Fastflow, cfg: ModelConfig) -> None:
     ):
         side = int(round(math.sqrt(num_patches)))
         if side * side == num_patches:
+            # パッチ総数が平方数であれば正方形として扱う
             spatial_h = spatial_w = side
 
     if spatial_h is None or spatial_w is None:
@@ -751,6 +812,7 @@ def configure_vit_layers(model: Fastflow, cfg: ModelConfig) -> None:
             h = w = int(input_hw)
         else:
             h = w = int(cfg.input_size)
+        # 入力解像度をパッチサイズで割ることで特徴マップのサイズを推定する
         spatial_h = max(1, h // patch_h)
         spatial_w = max(1, w // patch_w)
 
@@ -781,6 +843,7 @@ def configure_vit_layers(model: Fastflow, cfg: ModelConfig) -> None:
     original_get = getattr(inner.__class__, "_get_vit_features", None)
     if original_get is not None:
         setattr(inner, "_ff_original_get_vit_features", original_get)
+    # カスタム実装で特定層のみを抽出できるように差し替える
     inner._get_vit_features = types.MethodType(_fastflow_get_vit_features, inner)
     setattr(inner, "_selected_vit_layers", tuple(unique_layers))
 
@@ -792,6 +855,7 @@ def compute_scores(
     q: float,
     stage: str,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    # 指定データローダーを走査して異常スコア・ラベル・画像パスを収集する
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
     model.to(device)
@@ -803,6 +867,7 @@ def compute_scores(
         images = batch.image.to(device)
         labels_tensor = getattr(batch, "gt_label", None)
         if labels_tensor is None:
+            # ラベルが欠けている場合は -1 を入れて評価対象外とする
             label_array = np.full(images.shape[0], -1, dtype=int)
         else:
             label_array = labels_tensor.detach().cpu().numpy().astype(int)
@@ -824,8 +889,10 @@ def compute_scores(
             if scores_tensor is None:
                 flat = anomaly_map.view(anomaly_map.shape[0], -1)
                 if pooling.lower() == "pquantile":
+                    # 異常マップの分位点を用いた異常スコアを計算する
                     scores_tensor = torch.quantile(flat, q, dim=1)
                 else:
+                    # 既定では最大値プールで代表スコアを求める
                     scores_tensor = torch.amax(flat, dim=1)
             scores_tensor = scores_tensor.view(-1)
         score_chunks.append(scores_tensor.detach().cpu().numpy())
@@ -843,6 +910,7 @@ def compute_scores(
 
 
 def determine_threshold(train_scores: np.ndarray, epsilon: float) -> float:
+    # 学習データのスコアから基準となる閾値を統計的に推定する
     if train_scores.size == 0:
         return float(epsilon)
     finite_scores = train_scores[np.isfinite(train_scores)]
@@ -852,6 +920,7 @@ def determine_threshold(train_scores: np.ndarray, epsilon: float) -> float:
     quantile_based = float(np.quantile(finite_scores, 0.997))
     mean_value = float(finite_scores.mean())
     std_value = float(finite_scores.std())
+    # 最大値・分位点・ガウシアン近似のいずれかで最も大きい値を採用する
     gaussian_based = float(mean_value + 3.0 * std_value)
     threshold = max(max_based, quantile_based, gaussian_based)
     return float(max(threshold, epsilon))
@@ -863,6 +932,7 @@ def adapt_threshold(
     test_labels: np.ndarray,
     epsilon: float,
 ) -> float:
+    # テストデータに基づいて F1 と Youden 指数が最良となる閾値を探す
     if test_labels.size == 0:
         return base_threshold
     mask_good = test_labels == 0
@@ -874,6 +944,7 @@ def adapt_threshold(
     y_scores = test_scores[valid_mask]
     candidates = np.unique(np.concatenate((y_scores, np.asarray([base_threshold]))))
     if candidates.size > 512:
+        # 候補が多すぎる場合は分位点サンプリングで絞り込む
         quantiles = np.linspace(0.0, 1.0, num=512)
         candidates = np.unique(np.quantile(y_scores, quantiles))
         candidates = np.concatenate((candidates, np.asarray([base_threshold])))
@@ -894,6 +965,7 @@ def adapt_threshold(
         if (f1 > best_f1 + 1e-6) or (
             abs(f1 - best_f1) <= 1e-6 and youden > best_youden + 1e-6
         ):
+            # F1 優先、同点なら Youden が高い候補を採用する
             best_threshold = float(candidate)
             best_f1 = f1
             best_youden = youden
@@ -903,6 +975,7 @@ def adapt_threshold(
 def evaluate_predictions(
     scores: np.ndarray, labels: np.ndarray, paths: List[str], threshold: float
 ) -> None:
+    # 選択した閾値で予測を評価し、混同行列や誤分類をログ出力する
     predictions = (scores > threshold).astype(int)
     valid_mask = labels >= 0
     if valid_mask.any():
@@ -920,6 +993,7 @@ def evaluate_predictions(
         if mismatch_idx.size > 0:
             for i in mismatch_idx:
                 path = paths[i]
+                # 誤判定されたファイルとスコアをログに残す
                 log(
                     f"performance_misclassified path={path} score={scores[i]:.6f} label={int(y_true[i])} pred={int(y_pred[i])}"
                 )
@@ -928,11 +1002,14 @@ def evaluate_predictions(
 
 
 def save_checkpoint(path: Path, model: Fastflow, threshold: float) -> None:
+    # モデル重みと推定した閾値をまとめて保存する
     path.parent.mkdir(parents=True, exist_ok=True)
+    # 閾値も同梱して推論時に再利用できるようにする
     torch.save({"state_dict": model.state_dict(), "threshold": threshold}, path)
 
 
 def load_checkpoint(path: Path, model: Fastflow) -> Optional[float]:
+    # 保存済みチェックポイントを読み込み、閾値があれば返す
     if not path.exists():
         return None
     state = torch.load(path, map_location="cpu")
@@ -945,6 +1022,7 @@ def load_checkpoint(path: Path, model: Fastflow) -> Optional[float]:
         return None
     missing, unexpected = model.load_state_dict(raw_state, strict=False)
     if missing:
+        # 読み込み漏れがあってもログに記録して処理は継続する
         log(
             f"checkpoint_missing_keys path={path} count={len(missing)} example={missing[0]}"
         )
@@ -967,6 +1045,7 @@ def save_heatmaps(
     heatmap_cfg: HeatmapConfig,
     input_size: int,
 ) -> None:
+    # スコアと元画像を突き合わせてヒートマップを作成・保存する
     if not scores_by_path:
         return
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -990,6 +1069,7 @@ def save_heatmaps(
                 output = inner(images)
                 if isinstance(output, tuple):
                     hidden_variables = output[0]
+                    # モデルが tuple を返す場合は特徴量からヒートマップを再生成する
                     anomaly_map = inner.anomaly_map_generator(hidden_variables)
                 else:
                     anomaly_map = output.anomaly_map
@@ -1000,6 +1080,7 @@ def save_heatmaps(
             path_str = str(path_raw)
             score = scores_by_path.get(path_str)
             if score is None:
+                # スコアが存在しない画像はスキップする
                 continue
             src_path = Path(path_str)
             folder = (
@@ -1014,6 +1095,7 @@ def save_heatmaps(
             with Image.open(src_path) as img:
                 image = img.convert("RGB")
                 if score <= threshold:
+                    # 正常判定の場合は元画像をそのまま保存する
                     image.save(out_dir / src_path.name)
                     continue
                 if heat.ndim == 3:
@@ -1025,6 +1107,7 @@ def save_heatmaps(
                     heatmap_cfg.blur_kernel_size >= 3
                     and heatmap_cfg.blur_kernel_size % 2 == 1
                 ):
+                    # ノイズ抑制のためにガウシアンブラーをかける
                     heat_2d = cv2.GaussianBlur(
                         heat_2d,
                         (heatmap_cfg.blur_kernel_size, heatmap_cfg.blur_kernel_size),
@@ -1039,9 +1122,11 @@ def save_heatmaps(
                 lower_pct = heatmap_cfg.normalize_clip_lower_percentile
                 upper_pct = heatmap_cfg.normalize_clip_percentile
                 if 0.0 < upper_pct <= 1.0:
+                    # 上位パーセンタイルをクリップして極端な値を抑制する
                     upper_value = float(np.quantile(heat_values, upper_pct))
                     heat_2d = np.minimum(heat_2d, upper_value)
                 if 0.0 < lower_pct < 1.0:
+                    # 下位パーセンタイルも同様に底上げする
                     lower_value = float(np.quantile(heat_values, lower_pct))
                     heat_2d = np.maximum(heat_2d, lower_value)
                 heat_values = heat_2d[np.isfinite(heat_2d)]
@@ -1078,6 +1163,7 @@ def save_heatmaps(
                     if isinstance(heat_map_raw, np.ndarray):
                         heat_map_array = heat_map_raw
                     elif torch.is_tensor(heat_map_raw):
+                        # Tensor で返ってきた場合も numpy に変換して扱う
                         heat_map_array = heat_map_raw.detach().cpu().numpy()
                     if heat_map_array is None:
                         raise TypeError(
@@ -1097,6 +1183,7 @@ def save_heatmaps(
                 base_image = image
                 original_size = image.size
                 if heatmap_cfg.resize_to_input_size and input_size > 0:
+                    # 統一したサイズに合わせてヒートマップを重ねる
                     target_size = (int(input_size), int(input_size))
                     base_image = image.resize(target_size, resample=Image.BILINEAR)
                 heat_map_image = heat_map_image.resize(
@@ -1110,6 +1197,8 @@ def save_heatmaps(
 
 
 def main() -> None:
+    # 設定読み込みから学習・推論まで一連の処理を実行するエントリーポイント
+    # 実行のたびに結果が変わらないよう乱数シードを固定する
     seed_everything(42, workers=True)
     cfg, notes = load_config()
     log(f"config_model {asdict(cfg.model)}")
@@ -1122,14 +1211,17 @@ def main() -> None:
     pre_processor = Fastflow.configure_pre_processor(
         image_size=(cfg.model.input_size, cfg.model.input_size)
     )
+    # 設定に応じた前処理・後処理のパイプラインを用意する
     train_transform, eval_transform = build_transforms(cfg, pre_processor)
 
     def prepare_datamodule(worker_count: int) -> Folder:
+        # 要求されたワーカー数でデータモジュールを再構築する
         return build_datamodule(
             cfg, train_transform, eval_transform, num_workers=worker_count
         )
 
     def log_dataset_stats(dm: Folder, worker_count: int) -> Tuple[int, int, int]:
+        # データ分割ごとのサンプル数とワーカー数を記録する
         train_samples, val_samples, test_samples = summarize_datamodule(dm)
         log(
             "dataset_summary "
@@ -1146,6 +1238,7 @@ def main() -> None:
         datamodule, requested_workers
     )
     model = build_model(cfg, pre_processor)
+    # 利用可能な GPU があれば GPU で学習・推論を行う
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
     checkpoint_dir = cfg.output.model_path.parent
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -1165,12 +1258,14 @@ def main() -> None:
     )
 
     def run_training(dm: Folder, worker_count: int) -> None:
+        # Trainer を生成して学習を 1 回走らせる
         trainer = Trainer(**trainer_kwargs)
         log(f"train_start num_workers={worker_count}")
         trainer.fit(model=model, datamodule=dm)
         log("train_complete")
 
     if checkpoint_path.exists():
+        # 既存のチェックポイントがあれば学習をスキップする
         log(f"train_skip checkpoint_found={checkpoint_path}")
         if loaded_threshold is not None:
             log(f"checkpoint_threshold_loaded value={loaded_threshold:.6f}")
@@ -1186,6 +1281,7 @@ def main() -> None:
                     missing_metric
                     and cfg.model.lr_scheduler_monitor.lower() != "train_loss"
                 ):
+                    # モニタ対象が存在しない場合は train_loss 監視に切り替える
                     log(
                         "train_retry reason=missing_monitor fallback_monitor=train_loss"
                     )
@@ -1200,6 +1296,7 @@ def main() -> None:
                     for token in ("semlock", "please call `iter` first")
                 )
                 if requested_workers > 0 and permission_issue:
+                    # マルチプロセスが使えない環境ではワーカーを 0 にして再試行する
                     log(
                         "train_retry reason=multiprocessing_unavailable "
                         "fallback_num_workers=0"
@@ -1219,6 +1316,7 @@ def main() -> None:
         cfg.infer.q,
         "train_scoring",
     )
+    # 学習データから初期閾値を算出しておく
     base_threshold = determine_threshold(train_scores, cfg.infer.epsilon)
     test_scores, test_labels, test_paths = compute_scores(
         model,
@@ -1227,6 +1325,7 @@ def main() -> None:
         cfg.infer.q,
         "test",
     )
+    # テストデータをもとに最終的な閾値を調整する
     threshold = adapt_threshold(
         base_threshold, test_scores, test_labels, cfg.infer.epsilon
     )
@@ -1238,6 +1337,7 @@ def main() -> None:
     scores_by_path = {
         path: float(score) for path, score in zip(test_paths, test_scores)
     }
+    # 異常サンプルのヒートマップを保存して可視化する
     save_heatmaps(
         model,
         datamodule.test_dataloader(),
