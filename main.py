@@ -8,7 +8,7 @@ import types
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -256,6 +256,26 @@ class AppConfig:
     infer: InferConfig
     result: ResultConfig
     heatmap: HeatmapConfig
+
+
+@dataclass
+class RuntimeContext:
+    cfg: AppConfig
+    notes: List[str]
+    pre_processor: object
+    train_transform: object
+    eval_transform: object
+    datamodule: Folder
+    requested_workers: int
+    trainer_kwargs: Dict[str, object]
+    model: Fastflow
+    checkpoint_path: Path
+    loaded_threshold: Optional[float]
+    prepare_datamodule: Callable[[int], Folder]
+    log_dataset_stats: Callable[[Folder, int], Tuple[int, int, int]]
+
+
+_RUNTIME_CONTEXT: Optional[RuntimeContext] = None
 
 
 class EpochLogger(Callback):
@@ -1196,32 +1216,42 @@ def save_heatmaps(
         log(f"heatmap_stage batch={index + 1}/{total}")
 
 
-def main() -> None:
-    # 設定読み込みから学習・推論まで一連の処理を実行するエントリーポイント
-    # 実行のたびに結果が変わらないよう乱数シードを固定する
-    seed_everything(42, workers=True)
+def _initialize_runtime(
+    path_train: Optional[str],
+    path_test: Optional[str],
+    path_model: Optional[str],
+    path_result: Optional[str],
+    *,
+    log_config: bool,
+) -> RuntimeContext:
     cfg, notes = load_config()
-    log(f"config_model {asdict(cfg.model)}")
-    log(f"config_data {asdict(cfg.data)}")
-    log(f"config_output {asdict(cfg.output)}")
-    log(f"config_infer {asdict(cfg.infer)}")
-    log(f"config_result {asdict(cfg.result)}")
-    for note in notes:
-        log(f"config_note {note}")
+    if path_train is not None:
+        cfg.data.train_dir = Path(path_train)
+    if path_test is not None:
+        cfg.data.test_root = Path(path_test)
+    if path_model is not None:
+        cfg.output.model_path = Path(path_model)
+    if path_result is not None:
+        cfg.result.root = Path(path_result)
+    if log_config:
+        log(f"config_model {asdict(cfg.model)}")
+        log(f"config_data {asdict(cfg.data)}")
+        log(f"config_output {asdict(cfg.output)}")
+        log(f"config_infer {asdict(cfg.infer)}")
+        log(f"config_result {asdict(cfg.result)}")
+        for note in notes:
+            log(f"config_note {note}")
     pre_processor = Fastflow.configure_pre_processor(
         image_size=(cfg.model.input_size, cfg.model.input_size)
     )
-    # 設定に応じた前処理・後処理のパイプラインを用意する
     train_transform, eval_transform = build_transforms(cfg, pre_processor)
 
     def prepare_datamodule(worker_count: int) -> Folder:
-        # 要求されたワーカー数でデータモジュールを再構築する
         return build_datamodule(
             cfg, train_transform, eval_transform, num_workers=worker_count
         )
 
     def log_dataset_stats(dm: Folder, worker_count: int) -> Tuple[int, int, int]:
-        # データ分割ごとのサンプル数とワーカー数を記録する
         train_samples, val_samples, test_samples = summarize_datamodule(dm)
         log(
             "dataset_summary "
@@ -1234,17 +1264,13 @@ def main() -> None:
 
     requested_workers = cfg.data.num_workers
     datamodule = prepare_datamodule(requested_workers)
-    train_dataset_size, val_dataset_size, test_dataset_size = log_dataset_stats(
-        datamodule, requested_workers
-    )
+    log_dataset_stats(datamodule, requested_workers)
     model = build_model(cfg, pre_processor)
-    # 利用可能な GPU があれば GPU で学習・推論を行う
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    checkpoint_dir = cfg.output.model_path.parent
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = cfg.output.model_path
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     loaded_threshold = load_checkpoint(checkpoint_path, model)
-    trainer_kwargs = dict(
+    trainer_kwargs: Dict[str, object] = dict(
         max_epochs=cfg.model.num_epochs,
         accelerator=accelerator,
         devices=1,
@@ -1256,103 +1282,192 @@ def main() -> None:
         callbacks=[EpochLogger()],
         check_val_every_n_epoch=1,
     )
+    return RuntimeContext(
+        cfg=cfg,
+        notes=notes,
+        pre_processor=pre_processor,
+        train_transform=train_transform,
+        eval_transform=eval_transform,
+        datamodule=datamodule,
+        requested_workers=requested_workers,
+        trainer_kwargs=trainer_kwargs,
+        model=model,
+        checkpoint_path=checkpoint_path,
+        loaded_threshold=loaded_threshold,
+        prepare_datamodule=prepare_datamodule,
+        log_dataset_stats=log_dataset_stats,
+    )
 
-    def run_training(dm: Folder, worker_count: int) -> None:
-        # Trainer を生成して学習を 1 回走らせる
-        trainer = Trainer(**trainer_kwargs)
-        log(f"train_start num_workers={worker_count}")
-        trainer.fit(model=model, datamodule=dm)
-        log("train_complete")
 
+def train(path_train: str, path_model: str) -> RuntimeContext:
+    global _RUNTIME_CONTEXT
+    seed_everything(42, workers=True)
+    context = _initialize_runtime(path_train, None, path_model, None, log_config=True)
+    _RUNTIME_CONTEXT = context
+    checkpoint_path = context.checkpoint_path
+    loaded_threshold = context.loaded_threshold
     if checkpoint_path.exists():
-        # 既存のチェックポイントがあれば学習をスキップする
         log(f"train_skip checkpoint_found={checkpoint_path}")
         if loaded_threshold is not None:
             log(f"checkpoint_threshold_loaded value={loaded_threshold:.6f}")
-    else:
-        while True:
-            try:
-                run_training(datamodule, requested_workers)
-                break
-            except MisconfigurationException as exc:
-                message = str(exc).lower()
-                missing_metric = "conditioned on metric" in message
-                if (
-                    missing_metric
-                    and cfg.model.lr_scheduler_monitor.lower() != "train_loss"
-                ):
-                    # モニタ対象が存在しない場合は train_loss 監視に切り替える
-                    log(
-                        "train_retry reason=missing_monitor fallback_monitor=train_loss"
-                    )
-                    cfg.model.lr_scheduler_monitor = "train_loss"
-                    apply_learning_rate(model, cfg.model)
-                    continue
-                raise
-            except (PermissionError, RuntimeError) as exc:
-                message = str(exc).lower()
-                permission_issue = isinstance(exc, PermissionError) or any(
-                    token in message
-                    for token in ("semlock", "please call `iter` first")
+        return context
+    while True:
+        try:
+            trainer = Trainer(**context.trainer_kwargs)
+            log(f"train_start num_workers={context.requested_workers}")
+            trainer.fit(model=context.model, datamodule=context.datamodule)
+            log("train_complete")
+            torch.save({"state_dict": context.model.state_dict()}, checkpoint_path)
+            break
+        except MisconfigurationException as exc:
+            message = str(exc).lower()
+            missing_metric = "conditioned on metric" in message
+            if (
+                missing_metric
+                and context.cfg.model.lr_scheduler_monitor.lower() != "train_loss"
+            ):
+                log("train_retry reason=missing_monitor fallback_monitor=train_loss")
+                context.cfg.model.lr_scheduler_monitor = "train_loss"
+                apply_learning_rate(context.model, context.cfg.model)
+                continue
+            raise
+        except (PermissionError, RuntimeError) as exc:
+            message = str(exc).lower()
+            permission_issue = isinstance(exc, PermissionError) or any(
+                token in message for token in ("semlock", "please call `iter` first")
+            )
+            if context.requested_workers > 0 and permission_issue:
+                log(
+                    "train_retry reason=multiprocessing_unavailable "
+                    "fallback_num_workers=0"
                 )
-                if requested_workers > 0 and permission_issue:
-                    # マルチプロセスが使えない環境ではワーカーを 0 にして再試行する
-                    log(
-                        "train_retry reason=multiprocessing_unavailable "
-                        "fallback_num_workers=0"
-                    )
-                    requested_workers = 0
-                    cfg.data.num_workers = 0
-                    datamodule = prepare_datamodule(requested_workers)
-                    train_dataset_size, val_dataset_size, test_dataset_size = (
-                        log_dataset_stats(datamodule, requested_workers)
-                    )
-                    continue
-                raise
-    train_scores, train_labels, _ = compute_scores(
-        model,
-        datamodule.train_dataloader(),
-        cfg.infer.pooling,
-        cfg.infer.q,
-        "train_scoring",
-    )
-    # 学習データから初期閾値を算出しておく
-    base_threshold = determine_threshold(train_scores, cfg.infer.epsilon)
-    test_scores, test_labels, test_paths = compute_scores(
-        model,
-        datamodule.test_dataloader(),
-        cfg.infer.pooling,
-        cfg.infer.q,
-        "test",
-    )
-    # テストデータをもとに最終的な閾値を調整する
-    threshold = adapt_threshold(
-        base_threshold, test_scores, test_labels, cfg.infer.epsilon
-    )
-    log(f"threshold_base={base_threshold:.6f}")
-    log(f"threshold_final={threshold:.6f}")
-    save_checkpoint(cfg.output.model_path, model, threshold)
+                context.requested_workers = 0
+                context.cfg.data.num_workers = 0
+                context.datamodule = context.prepare_datamodule(
+                    context.requested_workers
+                )
+                context.log_dataset_stats(context.datamodule, context.requested_workers)
+                continue
+            raise
+    context.loaded_threshold = None
+    _RUNTIME_CONTEXT = context
+    return context
 
+
+def test(
+    path_model: str,
+    path_test: str,
+    path_result: str,
+    *,
+    skip_threshold_update: bool = False,
+) -> None:
+    global _RUNTIME_CONTEXT
+    seed_everything(42, workers=True)
+    context = _RUNTIME_CONTEXT
+    checkpoint_path = Path(path_model)
+    test_root = Path(path_test)
+    result_root = Path(path_result)
+    if (
+        context is None
+        or checkpoint_path != context.checkpoint_path
+        or test_root != context.cfg.data.test_root
+        or result_root != context.cfg.result.root
+    ):
+        context = _initialize_runtime(
+            str(context.cfg.data.train_dir) if context else None,
+            str(test_root),
+            str(checkpoint_path),
+            str(result_root),
+            log_config=context is None,
+        )
+        _RUNTIME_CONTEXT = context
+    else:
+        context.cfg.output.model_path = checkpoint_path
+        context.cfg.data.test_root = test_root
+        context.cfg.result.root = result_root
+    if context.checkpoint_path != checkpoint_path:
+        context.checkpoint_path = checkpoint_path
+    if context.cfg.data.test_root != test_root:
+        context.cfg.data.test_root = test_root
+        context.datamodule = context.prepare_datamodule(context.requested_workers)
+        context.log_dataset_stats(context.datamodule, context.requested_workers)
+    if context.cfg.result.root != result_root:
+        context.cfg.result.root = result_root
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"checkpoint not found at {checkpoint_path}. run training before test()"
+        )
+    context.loaded_threshold = load_checkpoint(checkpoint_path, context.model)
+
+    if skip_threshold_update:
+        if context.loaded_threshold is None:
+            raise RuntimeError(
+                "checkpoint does not contain a saved threshold; cannot skip re-estimation"
+            )
+        threshold = context.loaded_threshold
+        log(f"threshold_loaded={threshold:.6f}")
+        test_scores, test_labels, test_paths = compute_scores(
+            context.model,
+            context.datamodule.test_dataloader(),
+            context.cfg.infer.pooling,
+            context.cfg.infer.q,
+            "test",
+        )
+        log(f"threshold_final={threshold:.6f}")
+    else:
+        train_scores, _, _ = compute_scores(
+            context.model,
+            context.datamodule.train_dataloader(),
+            context.cfg.infer.pooling,
+            context.cfg.infer.q,
+            "train_scoring",
+        )
+        base_threshold = determine_threshold(train_scores, context.cfg.infer.epsilon)
+        test_scores, test_labels, test_paths = compute_scores(
+            context.model,
+            context.datamodule.test_dataloader(),
+            context.cfg.infer.pooling,
+            context.cfg.infer.q,
+            "test",
+        )
+        threshold = adapt_threshold(
+            base_threshold, test_scores, test_labels, context.cfg.infer.epsilon
+        )
+        log(f"threshold_base={base_threshold:.6f}")
+        log(f"threshold_final={threshold:.6f}")
+        save_checkpoint(checkpoint_path, context.model, threshold)
+    context.loaded_threshold = threshold
     evaluate_predictions(test_scores, test_labels, test_paths, threshold)
     scores_by_path = {
         path: float(score) for path, score in zip(test_paths, test_scores)
     }
-    # 異常サンプルのヒートマップを保存して可視化する
     save_heatmaps(
-        model,
-        datamodule.test_dataloader(),
+        context.model,
+        context.datamodule.test_dataloader(),
         scores_by_path,
         threshold,
-        cfg.result,
-        cfg.heatmap,
-        cfg.model.input_size,
+        context.cfg.result,
+        context.cfg.heatmap,
+        context.cfg.model.input_size,
     )
+    _RUNTIME_CONTEXT = context
 
 
 if __name__ == "__main__":
     try:
+        path_train = "data/train/good/"
+        path_model = "params/model.pth"
+        path_test = "data/test/"
+        path_result = "results/"
+
         print(sys.version)
-        main()
+        cfg_for_paths, _ = load_config()
+        train(path_train, path_model)
+        test(
+            path_model,
+            path_test,
+            path_result,
+        )
     except Exception:
         traceback.print_exc()
         sys.exit(1)
