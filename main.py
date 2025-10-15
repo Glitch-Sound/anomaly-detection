@@ -526,19 +526,17 @@ def build_transforms(cfg: AppConfig, pre_processor) -> Tuple[object, object]:
         base_ops = [base_transform]
     # 基本の前処理に軽めのデータ拡張を追加する
     train_ops = [
-        T.RandomHorizontalFlip(p=0.5),
-        T.RandomVerticalFlip(p=0.1),
         T.RandomAffine(
-            degrees=15,
+            degrees=5,
             translate=(0.03, 0.03),
-            scale=(0.95, 1.05),
+            scale=(0.98, 1.02),
             interpolation=T.InterpolationMode.BILINEAR,
         ),
         T.RandomApply(
             [T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15, hue=0.05)],
             p=0.3,
         ),
-        T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))], p=0.2),
+        T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))], p=0.1),
     ] + base_ops
     train_transform = T.Compose(train_ops)
     eval_transform = base_transform
@@ -1367,7 +1365,7 @@ def test(
     path_model: str,
     path_result: str,
     *,
-    skip_threshold_update: bool = False,
+    skip_threshold_update: bool = True,
 ) -> None:
     global _RUNTIME_CONTEXT
     seed_everything(42, workers=True)
