@@ -1471,7 +1471,7 @@ if __name__ == "__main__":
         print(sys.version)
 
         print("start train.")
-        # train(path_train, path_test, path_model, path_result)
+        train(path_train, path_test, path_model, path_result)
 
         print("start test.")
         test(path_train, path_test, path_model, path_result)
