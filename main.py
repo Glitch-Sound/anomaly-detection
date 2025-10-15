@@ -301,6 +301,7 @@ def resolve_backbone(requested: str) -> Tuple[str, int]:
         "wide_resnet50_2": 224,
         "deit_base_distilled_patch16_384": 384,
         "cait_m48_448": 448,
+        "vit_large_patch16_512": 512,
     }
     if requested in supported:
         return requested, supported[requested]
