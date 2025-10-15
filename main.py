@@ -1217,22 +1217,18 @@ def save_heatmaps(
 
 
 def _initialize_runtime(
-    path_train: Optional[str],
-    path_test: Optional[str],
-    path_model: Optional[str],
-    path_result: Optional[str],
+    path_train: str,
+    path_test: str,
+    path_model: str,
+    path_result: str,
     *,
     log_config: bool,
 ) -> RuntimeContext:
     cfg, notes = load_config()
-    if path_train is not None:
-        cfg.data.train_dir = Path(path_train)
-    if path_test is not None:
-        cfg.data.test_root = Path(path_test)
-    if path_model is not None:
-        cfg.output.model_path = Path(path_model)
-    if path_result is not None:
-        cfg.result.root = Path(path_result)
+    cfg.data.train_dir = Path(path_train)
+    cfg.data.test_root = Path(path_test)
+    cfg.output.model_path = Path(path_model)
+    cfg.result.root = Path(path_result)
     if log_config:
         log(f"config_model {asdict(cfg.model)}")
         log(f"config_data {asdict(cfg.data)}")
@@ -1299,10 +1295,21 @@ def _initialize_runtime(
     )
 
 
-def train(path_train: str, path_model: str) -> RuntimeContext:
+def train(
+    path_train: str,
+    path_test: str,
+    path_model: str,
+    path_result: str,
+) -> RuntimeContext:
     global _RUNTIME_CONTEXT
     seed_everything(42, workers=True)
-    context = _initialize_runtime(path_train, None, path_model, None, log_config=True)
+    context = _initialize_runtime(
+        path_train,
+        path_test,
+        path_model,
+        path_result,
+        log_config=True,
+    )
     _RUNTIME_CONTEXT = context
     checkpoint_path = context.checkpoint_path
     loaded_threshold = context.loaded_threshold
@@ -1355,8 +1362,9 @@ def train(path_train: str, path_model: str) -> RuntimeContext:
 
 
 def test(
-    path_model: str,
+    path_train: str,
     path_test: str,
+    path_model: str,
     path_result: str,
     *,
     skip_threshold_update: bool = False,
@@ -1364,27 +1372,30 @@ def test(
     global _RUNTIME_CONTEXT
     seed_everything(42, workers=True)
     context = _RUNTIME_CONTEXT
+    train_root = Path(path_train)
     checkpoint_path = Path(path_model)
     test_root = Path(path_test)
     result_root = Path(path_result)
     if (
         context is None
+        or train_root != context.cfg.data.train_dir
         or checkpoint_path != context.checkpoint_path
         or test_root != context.cfg.data.test_root
         or result_root != context.cfg.result.root
     ):
         context = _initialize_runtime(
-            str(context.cfg.data.train_dir) if context else None,
+            str(train_root),
             str(test_root),
             str(checkpoint_path),
             str(result_root),
             log_config=context is None,
         )
         _RUNTIME_CONTEXT = context
-    else:
-        context.cfg.output.model_path = checkpoint_path
-        context.cfg.data.test_root = test_root
-        context.cfg.result.root = result_root
+    context.cfg.output.model_path = checkpoint_path
+    if context.cfg.data.train_dir != train_root:
+        context.cfg.data.train_dir = train_root
+        context.datamodule = context.prepare_datamodule(context.requested_workers)
+        context.log_dataset_stats(context.datamodule, context.requested_workers)
     if context.checkpoint_path != checkpoint_path:
         context.checkpoint_path = checkpoint_path
     if context.cfg.data.test_root != test_root:
@@ -1455,19 +1466,13 @@ def test(
 
 if __name__ == "__main__":
     try:
-        path_train = "data/train/good/"
+        path_train = "data/train/good"
+        path_test = "data/test"
         path_model = "params/model.pth"
-        path_test = "data/test/"
-        path_result = "results/"
-
+        path_result = "result"
         print(sys.version)
-        cfg_for_paths, _ = load_config()
-        train(path_train, path_model)
-        test(
-            path_model,
-            path_test,
-            path_result,
-        )
+        train(path_train, path_test, path_model, path_result)
+        test(path_train, path_test, path_model, path_result)
     except Exception:
         traceback.print_exc()
         sys.exit(1)
