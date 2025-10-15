@@ -1365,7 +1365,7 @@ def test(
     path_model: str,
     path_result: str,
     *,
-    skip_threshold_update: bool = True,
+    skip_threshold_update: bool = False,
 ) -> None:
     global _RUNTIME_CONTEXT
     seed_everything(42, workers=True)
@@ -1469,10 +1469,16 @@ if __name__ == "__main__":
         path_model = "params/model.pth"
         path_result = "result"
         print(sys.version)
-        train(path_train, path_test, path_model, path_result)
+
+        print("start train.")
+        # train(path_train, path_test, path_model, path_result)
+
+        print("start test.")
         test(path_train, path_test, path_model, path_result)
+
     except Exception:
         traceback.print_exc()
         sys.exit(1)
+
     finally:
         sys.exit(0)
