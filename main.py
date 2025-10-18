@@ -237,6 +237,8 @@ class InferConfig:
     epsilon: float
     fixed_threshold: Optional[float]
     train_threshold_quantile: float
+    quantile_mean_weight: float
+    quantile_std_weight: float
 
 
 @dataclass
@@ -285,6 +287,7 @@ class RuntimeContext:
 
 
 _RUNTIME_CONTEXT: Optional[RuntimeContext] = None
+_PREFERRED_NUM_WORKERS: Optional[int] = None
 
 
 class EpochLogger(Callback):
@@ -407,15 +410,19 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
     train_threshold_quantile = parser.getfloat(
         "THRESHOLD", "train_threshold_quantile", fallback=0.997
     )
-    train_threshold_quantile = float(
-        min(max(train_threshold_quantile, 0.0), 1.0)
-    )
+    train_threshold_quantile = float(min(max(train_threshold_quantile, 0.0), 1.0))
     infer_cfg = InferConfig(
         pooling=parser.get("INFER", "score_pooling", fallback="max").strip(),
         q=parser.getfloat("INFER", "score_q", fallback=0.995),
         epsilon=parser.getfloat("THRESHOLD", "epsilon", fallback=1e-6),
         fixed_threshold=fixed_threshold,
         train_threshold_quantile=train_threshold_quantile,
+        quantile_mean_weight=parser.getfloat(
+            "INFER", "score_quantile_mean_weight", fallback=0.0
+        ),
+        quantile_std_weight=parser.getfloat(
+            "INFER", "score_quantile_std_weight", fallback=0.0
+        ),
     )
     result_cfg = ResultConfig(
         root=Path(parser.get("RESULT", "output_dir", fallback="result")),
@@ -773,7 +780,7 @@ def build_model(cfg: AppConfig, pre_processor) -> Fastflow:
         conv3x3_only=cfg.model.conv3x3_only,
         hidden_ratio=cfg.model.hidden_ratio,
         pre_processor=pre_processor,
-        post_processor=False,
+        post_processor=True,
         evaluator=False,
         visualizer=False,
     )
@@ -913,6 +920,8 @@ def compute_scores(
     pooling: str,
     q: float,
     stage: str,
+    quantile_mean_weight: float,
+    quantile_std_weight: float,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     # 指定データローダーを走査して異常スコア・ラベル・画像パスを収集する
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -932,9 +941,9 @@ def compute_scores(
             label_array = labels_tensor.detach().cpu().numpy().astype(int)
         with torch.no_grad():
             predictions = model(images)
-            scores_tensor = getattr(predictions, "pred_score", None)
+            scores_tensor = None
             anomaly_map = getattr(predictions, "anomaly_map", None)
-            if anomaly_map is None or scores_tensor is None:
+            if anomaly_map is None:
                 inner: torch.nn.Module = getattr(model, "model", model)
                 inner.eval()
                 output = inner(images)
@@ -949,11 +958,20 @@ def compute_scores(
                 flat = anomaly_map.view(anomaly_map.shape[0], -1)
                 if pooling.lower() == "pquantile":
                     # 異常マップの分位点を用いた異常スコアを計算する
-                    scores_tensor = torch.quantile(flat, q, dim=1)
+                    upper = torch.quantile(flat, q, dim=1)
+                    mean_values = flat.mean(dim=1)
+                    std_values = flat.std(dim=1)
+                    scores_tensor = upper.clone()
+                    if quantile_mean_weight != 0.0:
+                        scores_tensor = (
+                            scores_tensor - quantile_mean_weight * mean_values
+                        )
+                    if quantile_std_weight != 0.0:
+                        scores_tensor = scores_tensor + quantile_std_weight * std_values
                 else:
                     # 既定では最大値プールで代表スコアを求める
                     scores_tensor = torch.amax(flat, dim=1)
-            scores_tensor = scores_tensor.view(-1)
+            scores_tensor = scores_tensor.view(-1).abs()
         score_chunks.append(scores_tensor.detach().cpu().numpy())
         label_chunks.append(label_array)
         batch_paths = (
@@ -968,6 +986,39 @@ def compute_scores(
     return scores, labels, paths
 
 
+def log_score_statistics(label: str, scores: np.ndarray) -> None:
+    # スコア分布の概要を出力し、閾値設計の参考にする
+    finite_scores = scores[np.isfinite(scores)]
+    if finite_scores.size == 0:
+        log(f"{label}_stats empty")
+        return
+    percentiles = np.percentile(finite_scores, [50, 90, 95, 99])
+    log(
+        f"{label}_stats "
+        f"count={finite_scores.size} "
+        f"min={float(finite_scores.min()):.6f} "
+        f"max={float(finite_scores.max()):.6f} "
+        f"mean={float(finite_scores.mean()):.6f} "
+        f"std={float(finite_scores.std()):.6f} "
+        f"p50={float(percentiles[0]):.6f} "
+        f"p90={float(percentiles[1]):.6f} "
+        f"p95={float(percentiles[2]):.6f} "
+        f"p99={float(percentiles[3]):.6f}"
+    )
+
+
+def log_split_score_statistics(scores: np.ndarray, labels: np.ndarray) -> None:
+    # 正常・異常それぞれのスコア分布を出力する
+    if labels.size == 0:
+        return
+    mask_good = labels == 0
+    mask_error = labels == 1
+    if mask_good.any():
+        log_score_statistics("test_scores_good", scores[mask_good])
+    if mask_error.any():
+        log_score_statistics("test_scores_error", scores[mask_error])
+
+
 def determine_threshold(
     train_scores: np.ndarray, epsilon: float, quantile: float
 ) -> float:
@@ -977,15 +1028,17 @@ def determine_threshold(
     finite_scores = train_scores[np.isfinite(train_scores)]
     if finite_scores.size == 0:
         return float(epsilon)
-    max_based = float(finite_scores.max() + epsilon)
     clamped_quantile = float(min(max(quantile, 0.0), 1.0))
     quantile_based = float(np.quantile(finite_scores, clamped_quantile))
     mean_value = float(finite_scores.mean())
     std_value = float(finite_scores.std())
-    # 最大値・分位点・ガウシアン近似のいずれかで最も大きい値を採用する
+    # 分位点とガウシアン近似のうち大きい方を採用し、突出値に過度に引きずられないようにする
     gaussian_based = float(mean_value + 3.0 * std_value)
-    threshold = max(max_based, quantile_based, gaussian_based)
-    return float(max(threshold, epsilon))
+    threshold = quantile_based
+    if np.isfinite(gaussian_based):
+        threshold = min(threshold, gaussian_based)
+    threshold = max(threshold - epsilon, epsilon)
+    return float(threshold)
 
 
 def adapt_threshold(
@@ -1267,6 +1320,7 @@ def _initialize_runtime(
     log_config: bool,
     val_from_train: bool = False,
     include_test_split: Optional[bool] = None,
+    initial_num_workers: Optional[int] = None,
 ) -> RuntimeContext:
     cfg, notes = load_config()
     if path_train is not None:
@@ -1277,6 +1331,11 @@ def _initialize_runtime(
         cfg.output.model_path = Path(path_model)
     if path_result is not None:
         cfg.result.root = Path(path_result)
+    global _PREFERRED_NUM_WORKERS
+    if _PREFERRED_NUM_WORKERS is not None:
+        cfg.data.num_workers = max(0, int(_PREFERRED_NUM_WORKERS))
+    elif initial_num_workers is not None:
+        cfg.data.num_workers = max(0, int(initial_num_workers))
     if include_test_split is None:
         include_test_split = not val_from_train
     if log_config:
@@ -1361,7 +1420,7 @@ def train(
     path_train: str,
     path_model: str,
 ) -> RuntimeContext:
-    global _RUNTIME_CONTEXT
+    global _RUNTIME_CONTEXT, _PREFERRED_NUM_WORKERS
     seed_everything(42, workers=True)
     context = _initialize_runtime(
         path_train=path_train,
@@ -1399,13 +1458,20 @@ def train(
         except (PermissionError, RuntimeError) as exc:
             message = str(exc).lower()
             permission_issue = isinstance(exc, PermissionError) or any(
-                token in message for token in ("semlock", "please call `iter` first")
+                token in message
+                for token in (
+                    "semlock",
+                    "please call `iter` first",
+                    "please call `iter(combined_loader)` first",
+                    "please call `iter(",
+                )
             )
             if context.requested_workers > 0 and permission_issue:
                 log(
                     "train_retry reason=multiprocessing_unavailable "
                     "fallback_num_workers=0"
                 )
+                _PREFERRED_NUM_WORKERS = 0
                 context.requested_workers = 0
                 context.cfg.data.num_workers = 0
                 context.datamodule = context.prepare_datamodule(
@@ -1426,7 +1492,10 @@ def train(
             context.cfg.infer.pooling,
             context.cfg.infer.q,
             "train_scoring",
+            context.cfg.infer.quantile_mean_weight,
+            context.cfg.infer.quantile_std_weight,
         )
+        log_score_statistics("train_scores", train_scores)
         base_threshold = determine_threshold(
             train_scores,
             context.cfg.infer.epsilon,
@@ -1471,6 +1540,7 @@ def test(
             log_config=context is None,
             val_from_train=False,
             include_test_split=True,
+            initial_num_workers=context.requested_workers if context else None,
         )
         _RUNTIME_CONTEXT = context
     if context.checkpoint_path != checkpoint_path:
@@ -1498,7 +1568,11 @@ def test(
             context.cfg.infer.pooling,
             context.cfg.infer.q,
             "test",
+            context.cfg.infer.quantile_mean_weight,
+            context.cfg.infer.quantile_std_weight,
         )
+        log_score_statistics("test_scores", test_scores)
+        log_split_score_statistics(test_scores, test_labels)
         log(f"threshold_final={threshold:.6f}")
     else:
         if context.loaded_threshold is None:
@@ -1515,7 +1589,10 @@ def test(
                 context.cfg.infer.pooling,
                 context.cfg.infer.q,
                 "train_scoring",
+                context.cfg.infer.quantile_mean_weight,
+                context.cfg.infer.quantile_std_weight,
             )
+            log_score_statistics("train_scores", train_scores)
             base_threshold = determine_threshold(
                 train_scores,
                 context.cfg.infer.epsilon,
@@ -1527,7 +1604,11 @@ def test(
                 context.cfg.infer.pooling,
                 context.cfg.infer.q,
                 "test",
+                context.cfg.infer.quantile_mean_weight,
+                context.cfg.infer.quantile_std_weight,
             )
+            log_score_statistics("test_scores", test_scores)
+            log_split_score_statistics(test_scores, test_labels)
             threshold = adapt_threshold(
                 base_threshold, test_scores, test_labels, context.cfg.infer.epsilon
             )
@@ -1542,7 +1623,11 @@ def test(
                 context.cfg.infer.pooling,
                 context.cfg.infer.q,
                 "test",
+                context.cfg.infer.quantile_mean_weight,
+                context.cfg.infer.quantile_std_weight,
             )
+            log_score_statistics("test_scores", test_scores)
+            log_split_score_statistics(test_scores, test_labels)
             log(f"threshold_loaded={threshold:.6f}")
             log(f"threshold_final={threshold:.6f}")
     evaluate_predictions(test_scores, test_labels, test_paths, threshold)
