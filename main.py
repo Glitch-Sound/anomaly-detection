@@ -32,6 +32,11 @@ warnings.filterwarnings(
     "ignore", message="The 'train_dataloader' does not have many workers"
 )
 warnings.filterwarnings("ignore", message="Trying to infer the `batch_size`")
+warnings.filterwarnings(
+    "ignore",
+    message="No positive samples found in target, recall is undefined.*",
+    category=UserWarning,
+)
 
 
 MODELS_DIR = (Path(__file__).resolve().parent / "models").resolve()
@@ -230,6 +235,8 @@ class InferConfig:
     pooling: str
     q: float
     epsilon: float
+    fixed_threshold: Optional[float]
+    train_threshold_quantile: float
 
 
 @dataclass
@@ -273,6 +280,8 @@ class RuntimeContext:
     loaded_threshold: Optional[float]
     prepare_datamodule: Callable[[int], Folder]
     log_dataset_stats: Callable[[Folder, int], Tuple[int, int, int]]
+    val_from_train: bool
+    include_test_split: bool
 
 
 _RUNTIME_CONTEXT: Optional[RuntimeContext] = None
@@ -385,10 +394,28 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
             parser.get("OUTPUT", "model_save_path", fallback="params/model.pth")
         ),
     )
+    fixed_threshold: Optional[float] = None
+    fixed_threshold_raw = parser.get(
+        "THRESHOLD", "fixed_threshold", fallback=""
+    ).strip()
+    if fixed_threshold_raw:
+        try:
+            fixed_threshold = float(fixed_threshold_raw)
+        except ValueError:
+            notes.append(f"invalid_fixed_threshold value={fixed_threshold_raw}")
+            fixed_threshold = None
+    train_threshold_quantile = parser.getfloat(
+        "THRESHOLD", "train_threshold_quantile", fallback=0.997
+    )
+    train_threshold_quantile = float(
+        min(max(train_threshold_quantile, 0.0), 1.0)
+    )
     infer_cfg = InferConfig(
         pooling=parser.get("INFER", "score_pooling", fallback="max").strip(),
         q=parser.getfloat("INFER", "score_q", fallback=0.995),
         epsilon=parser.getfloat("THRESHOLD", "epsilon", fallback=1e-6),
+        fixed_threshold=fixed_threshold,
+        train_threshold_quantile=train_threshold_quantile,
     )
     result_cfg = ResultConfig(
         root=Path(parser.get("RESULT", "output_dir", fallback="result")),
@@ -560,7 +587,13 @@ def _assign_datamodule_transform(dm: Folder, split: str, transform) -> None:
 
 
 def build_datamodule(
-    cfg: AppConfig, train_transform, eval_transform, num_workers: int = 3
+    cfg: AppConfig,
+    train_transform,
+    eval_transform,
+    num_workers: int = 3,
+    *,
+    val_from_train: bool = False,
+    include_test_split: bool = True,
 ) -> Folder:
     # anomalib の Folder データモジュールを設定値に従って初期化する
     dm_kwargs = dict(
@@ -575,8 +608,8 @@ def build_datamodule(
         augmentations=train_transform,
     )
     if cfg.data.val_split_ratio > 0.0:
-        # 検証データを確保する場合はテストと同じ分割方法を使用する
-        dm_kwargs["val_split_mode"] = "same_as_test"
+        # 検証データ用にトレーニングデータを分割するか、従来通りテストセットを利用するかを切り替える
+        dm_kwargs["val_split_mode"] = "from_train" if val_from_train else "same_as_test"
     else:
         dm_kwargs["val_split_mode"] = "none"
     try:
@@ -585,7 +618,11 @@ def build_datamodule(
         # 古い anomalib では val_split_ratio が存在しないため取り除いて再試行する
         dm_kwargs.pop("val_split_ratio", None)
         dm = Folder(**dm_kwargs)
-    dm.setup()
+    setup_stage = "fit" if not include_test_split else None
+    if setup_stage is None:
+        dm.setup()
+    else:
+        dm.setup(stage=setup_stage)
     _assign_datamodule_transform(dm, "train", train_transform)
     for split in ("val", "test", "predict"):
         # 評価系のデータには評価用変換を一括で適用する
@@ -593,7 +630,7 @@ def build_datamodule(
     return dm
 
 
-def summarize_datamodule(dm: Folder) -> Tuple[int, int, int]:
+def summarize_datamodule(dm: Folder, include_test_split: bool) -> Tuple[int, int, int]:
     # データモジュールの各分割に含まれるサンプル数を取得する
     train_size = len(dm.train_dataloader().dataset)
 
@@ -612,7 +649,10 @@ def summarize_datamodule(dm: Folder) -> Tuple[int, int, int]:
         return len(dataset) if dataset is not None else 0
 
     val_size = _loader_size(dm.val_dataloader())
-    test_size = _loader_size(dm.test_dataloader())
+    test_size = 0
+    if include_test_split and hasattr(dm, "test_dataloader"):
+        test_loader = dm.test_dataloader()
+        test_size = _loader_size(test_loader)
     return train_size, val_size, test_size
 
 
@@ -733,7 +773,7 @@ def build_model(cfg: AppConfig, pre_processor) -> Fastflow:
         conv3x3_only=cfg.model.conv3x3_only,
         hidden_ratio=cfg.model.hidden_ratio,
         pre_processor=pre_processor,
-        post_processor=True,
+        post_processor=False,
         evaluator=False,
         visualizer=False,
     )
@@ -928,7 +968,9 @@ def compute_scores(
     return scores, labels, paths
 
 
-def determine_threshold(train_scores: np.ndarray, epsilon: float) -> float:
+def determine_threshold(
+    train_scores: np.ndarray, epsilon: float, quantile: float
+) -> float:
     # 学習データのスコアから基準となる閾値を統計的に推定する
     if train_scores.size == 0:
         return float(epsilon)
@@ -936,7 +978,8 @@ def determine_threshold(train_scores: np.ndarray, epsilon: float) -> float:
     if finite_scores.size == 0:
         return float(epsilon)
     max_based = float(finite_scores.max() + epsilon)
-    quantile_based = float(np.quantile(finite_scores, 0.997))
+    clamped_quantile = float(min(max(quantile, 0.0), 1.0))
+    quantile_based = float(np.quantile(finite_scores, clamped_quantile))
     mean_value = float(finite_scores.mean())
     std_value = float(finite_scores.std())
     # 最大値・分位点・ガウシアン近似のいずれかで最も大きい値を採用する
@@ -1216,18 +1259,26 @@ def save_heatmaps(
 
 
 def _initialize_runtime(
-    path_train: str,
-    path_test: str,
-    path_model: str,
-    path_result: str,
+    path_train: Optional[str] = None,
+    path_test: Optional[str] = None,
+    path_model: Optional[str] = None,
+    path_result: Optional[str] = None,
     *,
     log_config: bool,
+    val_from_train: bool = False,
+    include_test_split: Optional[bool] = None,
 ) -> RuntimeContext:
     cfg, notes = load_config()
-    cfg.data.train_dir = Path(path_train)
-    cfg.data.test_root = Path(path_test)
-    cfg.output.model_path = Path(path_model)
-    cfg.result.root = Path(path_result)
+    if path_train is not None:
+        cfg.data.train_dir = Path(path_train)
+    if path_test is not None:
+        cfg.data.test_root = Path(path_test)
+    if path_model is not None:
+        cfg.output.model_path = Path(path_model)
+    if path_result is not None:
+        cfg.result.root = Path(path_result)
+    if include_test_split is None:
+        include_test_split = not val_from_train
     if log_config:
         log(f"config_model {asdict(cfg.model)}")
         log(f"config_data {asdict(cfg.data)}")
@@ -1243,11 +1294,18 @@ def _initialize_runtime(
 
     def prepare_datamodule(worker_count: int) -> Folder:
         return build_datamodule(
-            cfg, train_transform, eval_transform, num_workers=worker_count
+            cfg,
+            train_transform,
+            eval_transform,
+            num_workers=worker_count,
+            val_from_train=val_from_train,
+            include_test_split=include_test_split,
         )
 
     def log_dataset_stats(dm: Folder, worker_count: int) -> Tuple[int, int, int]:
-        train_samples, val_samples, test_samples = summarize_datamodule(dm)
+        train_samples, val_samples, test_samples = summarize_datamodule(
+            dm, include_test_split
+        )
         log(
             "dataset_summary "
             f"train_samples={train_samples} "
@@ -1265,6 +1323,9 @@ def _initialize_runtime(
     checkpoint_path = cfg.output.model_path
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     loaded_threshold = load_checkpoint(checkpoint_path, model)
+    if cfg.infer.fixed_threshold is not None:
+        loaded_threshold = float(cfg.infer.fixed_threshold)
+        log(f"threshold_config_fixed value={loaded_threshold:.6f}")
     trainer_kwargs: Dict[str, object] = dict(
         max_epochs=cfg.model.num_epochs,
         accelerator=accelerator,
@@ -1291,23 +1352,22 @@ def _initialize_runtime(
         loaded_threshold=loaded_threshold,
         prepare_datamodule=prepare_datamodule,
         log_dataset_stats=log_dataset_stats,
+        val_from_train=val_from_train,
+        include_test_split=include_test_split,
     )
 
 
 def train(
     path_train: str,
-    path_test: str,
     path_model: str,
-    path_result: str,
 ) -> RuntimeContext:
     global _RUNTIME_CONTEXT
     seed_everything(42, workers=True)
     context = _initialize_runtime(
-        path_train,
-        path_test,
-        path_model,
-        path_result,
+        path_train=path_train,
+        path_model=path_model,
         log_config=True,
+        val_from_train=True,
     )
     _RUNTIME_CONTEXT = context
     checkpoint_path = context.checkpoint_path
@@ -1323,7 +1383,6 @@ def train(
             log(f"train_start num_workers={context.requested_workers}")
             trainer.fit(model=context.model, datamodule=context.datamodule)
             log("train_complete")
-            torch.save({"state_dict": context.model.state_dict()}, checkpoint_path)
             break
         except MisconfigurationException as exc:
             message = str(exc).lower()
@@ -1355,48 +1414,68 @@ def train(
                 context.log_dataset_stats(context.datamodule, context.requested_workers)
                 continue
             raise
-    context.loaded_threshold = None
+    fixed_threshold = context.cfg.infer.fixed_threshold
+    if fixed_threshold is not None:
+        threshold = float(fixed_threshold)
+        log(f"threshold_fixed={threshold:.6f}")
+        log(f"threshold_final={threshold:.6f}")
+    else:
+        train_scores, _, _ = compute_scores(
+            context.model,
+            context.datamodule.train_dataloader(),
+            context.cfg.infer.pooling,
+            context.cfg.infer.q,
+            "train_scoring",
+        )
+        base_threshold = determine_threshold(
+            train_scores,
+            context.cfg.infer.epsilon,
+            context.cfg.infer.train_threshold_quantile,
+        )
+        threshold = base_threshold
+        log(f"threshold_base={base_threshold:.6f}")
+        log(f"threshold_final={threshold:.6f}")
+    save_checkpoint(checkpoint_path, context.model, threshold)
+    context.loaded_threshold = threshold
     _RUNTIME_CONTEXT = context
     return context
 
 
 def test(
-    path_train: str,
     path_test: str,
     path_model: str,
     path_result: str,
     *,
-    skip_threshold_update: bool = False,
+    skip_threshold_update: bool = True,
 ) -> None:
     global _RUNTIME_CONTEXT
     seed_everything(42, workers=True)
     context = _RUNTIME_CONTEXT
-    train_root = Path(path_train)
     checkpoint_path = Path(path_model)
     test_root = Path(path_test)
     result_root = Path(path_result)
-    if (
-        context is None
-        or train_root != context.cfg.data.train_dir
-        or checkpoint_path != context.checkpoint_path
-        or test_root != context.cfg.data.test_root
-        or result_root != context.cfg.result.root
-    ):
+    needs_reinit = True
+    if context is not None:
+        needs_reinit = (
+            context.include_test_split is False
+            or context.val_from_train
+            or checkpoint_path != context.checkpoint_path
+            or test_root != context.cfg.data.test_root
+            or result_root != context.cfg.result.root
+        )
+    if needs_reinit:
         context = _initialize_runtime(
-            str(train_root),
-            str(test_root),
-            str(checkpoint_path),
-            str(result_root),
+            path_test=str(test_root),
+            path_model=str(checkpoint_path),
+            path_result=str(result_root),
             log_config=context is None,
+            val_from_train=False,
+            include_test_split=True,
         )
         _RUNTIME_CONTEXT = context
-    context.cfg.output.model_path = checkpoint_path
-    if context.cfg.data.train_dir != train_root:
-        context.cfg.data.train_dir = train_root
-        context.datamodule = context.prepare_datamodule(context.requested_workers)
-        context.log_dataset_stats(context.datamodule, context.requested_workers)
     if context.checkpoint_path != checkpoint_path:
         context.checkpoint_path = checkpoint_path
+        context.cfg.output.model_path = checkpoint_path
     if context.cfg.data.test_root != test_root:
         context.cfg.data.test_root = test_root
         context.datamodule = context.prepare_datamodule(context.requested_workers)
@@ -1407,46 +1486,65 @@ def test(
         raise FileNotFoundError(
             f"checkpoint not found at {checkpoint_path}. run training before test()"
         )
-    context.loaded_threshold = load_checkpoint(checkpoint_path, context.model)
-
-    if skip_threshold_update:
-        if context.loaded_threshold is None:
-            raise RuntimeError(
-                "checkpoint does not contain a saved threshold; cannot skip re-estimation"
-            )
-        threshold = context.loaded_threshold
-        log(f"threshold_loaded={threshold:.6f}")
+    fixed_threshold = context.cfg.infer.fixed_threshold
+    test_dataloader = context.datamodule.test_dataloader()
+    if fixed_threshold is not None:
+        threshold = float(fixed_threshold)
+        context.loaded_threshold = threshold
+        log(f"threshold_fixed={threshold:.6f}")
         test_scores, test_labels, test_paths = compute_scores(
             context.model,
-            context.datamodule.test_dataloader(),
+            test_dataloader,
             context.cfg.infer.pooling,
             context.cfg.infer.q,
             "test",
         )
         log(f"threshold_final={threshold:.6f}")
     else:
-        train_scores, _, _ = compute_scores(
-            context.model,
-            context.datamodule.train_dataloader(),
-            context.cfg.infer.pooling,
-            context.cfg.infer.q,
-            "train_scoring",
-        )
-        base_threshold = determine_threshold(train_scores, context.cfg.infer.epsilon)
-        test_scores, test_labels, test_paths = compute_scores(
-            context.model,
-            context.datamodule.test_dataloader(),
-            context.cfg.infer.pooling,
-            context.cfg.infer.q,
-            "test",
-        )
-        threshold = adapt_threshold(
-            base_threshold, test_scores, test_labels, context.cfg.infer.epsilon
-        )
-        log(f"threshold_base={base_threshold:.6f}")
-        log(f"threshold_final={threshold:.6f}")
-        save_checkpoint(checkpoint_path, context.model, threshold)
-    context.loaded_threshold = threshold
+        if context.loaded_threshold is None:
+            context.loaded_threshold = load_checkpoint(checkpoint_path, context.model)
+        threshold = context.loaded_threshold
+        if threshold is None and skip_threshold_update:
+            raise RuntimeError(
+                "checkpoint does not contain a saved threshold; cannot skip re-estimation"
+            )
+        if not skip_threshold_update or threshold is None:
+            train_scores, _, _ = compute_scores(
+                context.model,
+                context.datamodule.train_dataloader(),
+                context.cfg.infer.pooling,
+                context.cfg.infer.q,
+                "train_scoring",
+            )
+            base_threshold = determine_threshold(
+                train_scores,
+                context.cfg.infer.epsilon,
+                context.cfg.infer.train_threshold_quantile,
+            )
+            test_scores, test_labels, test_paths = compute_scores(
+                context.model,
+                test_dataloader,
+                context.cfg.infer.pooling,
+                context.cfg.infer.q,
+                "test",
+            )
+            threshold = adapt_threshold(
+                base_threshold, test_scores, test_labels, context.cfg.infer.epsilon
+            )
+            log(f"threshold_base={base_threshold:.6f}")
+            log(f"threshold_final={threshold:.6f}")
+            save_checkpoint(checkpoint_path, context.model, threshold)
+            context.loaded_threshold = threshold
+        else:
+            test_scores, test_labels, test_paths = compute_scores(
+                context.model,
+                test_dataloader,
+                context.cfg.infer.pooling,
+                context.cfg.infer.q,
+                "test",
+            )
+            log(f"threshold_loaded={threshold:.6f}")
+            log(f"threshold_final={threshold:.6f}")
     evaluate_predictions(test_scores, test_labels, test_paths, threshold)
     scores_by_path = {
         path: float(score) for path, score in zip(test_paths, test_scores)
@@ -1472,10 +1570,10 @@ if __name__ == "__main__":
         print(sys.version)
 
         print("start train.")
-        train(path_train, path_test, path_model, path_result)
+        train(path_train, path_model)
 
         print("start test.")
-        test(path_train, path_test, path_model, path_result)
+        test(path_test, path_model, path_result)
 
     except Exception:
         traceback.print_exc()
