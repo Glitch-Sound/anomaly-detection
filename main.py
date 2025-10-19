@@ -931,6 +931,36 @@ def compute_scores(
     score_chunks: List[np.ndarray] = []
     label_chunks: List[np.ndarray] = []
     paths: List[str] = []
+    pooling_tracker = None
+    if pooling.lower() == "pquantile":
+        pooling_tracker = {
+            "quantile": {
+                "count": 0,
+                "sum": 0.0,
+                "sum_sq": 0.0,
+                "min": None,
+                "max": None,
+            },
+            "mean": {"count": 0, "sum": 0.0, "sum_sq": 0.0, "min": None, "max": None},
+            "std": {"count": 0, "sum": 0.0, "sum_sq": 0.0, "min": None, "max": None},
+        }
+
+        def _update_pooling_stats(stats: Dict[str, object], values: np.ndarray) -> None:
+            flat = values.reshape(-1)
+            if flat.size == 0:
+                return
+            stats["count"] += int(flat.size)
+            stats["sum"] += float(flat.sum())
+            stats["sum_sq"] += float(np.dot(flat, flat))
+            current_min = float(flat.min())
+            current_max = float(flat.max())
+            if stats["min"] is None:
+                stats["min"] = current_min
+                stats["max"] = current_max
+            else:
+                stats["min"] = min(stats["min"], current_min)
+                stats["max"] = max(stats["max"], current_max)
+
     for index, batch in enumerate(dataloader):
         images = batch.image.to(device)
         labels_tensor = getattr(batch, "gt_label", None)
@@ -968,6 +998,19 @@ def compute_scores(
                         )
                     if quantile_std_weight != 0.0:
                         scores_tensor = scores_tensor + quantile_std_weight * std_values
+                    if pooling_tracker is not None:
+                        _update_pooling_stats(
+                            pooling_tracker["quantile"],
+                            upper.detach().cpu().numpy(),
+                        )
+                        _update_pooling_stats(
+                            pooling_tracker["mean"],
+                            mean_values.detach().cpu().numpy(),
+                        )
+                        _update_pooling_stats(
+                            pooling_tracker["std"],
+                            std_values.detach().cpu().numpy(),
+                        )
                 else:
                     # 既定では最大値プールで代表スコアを求める
                     scores_tensor = torch.amax(flat, dim=1)
@@ -983,6 +1026,26 @@ def compute_scores(
         log(f"inference_stage={stage} batch={index + 1}/{total}")
     scores = np.concatenate(score_chunks) if score_chunks else np.empty(0)
     labels = np.concatenate(label_chunks) if label_chunks else np.empty(0, dtype=int)
+    if pooling_tracker is not None and pooling_tracker["quantile"]["count"] > 0:
+        for component, stats in pooling_tracker.items():
+            count = stats["count"]
+            if count == 0:
+                continue
+            mean_value = stats["sum"] / count
+            variance = max(stats["sum_sq"] / count - mean_value * mean_value, 0.0)
+            std_value = math.sqrt(variance)
+            min_value = (
+                float(stats["min"]) if stats["min"] is not None else float("nan")
+            )
+            max_value = (
+                float(stats["max"]) if stats["max"] is not None else float("nan")
+            )
+            log(
+                "pooling_stats "
+                f"stage={stage} component={component} "
+                f"count={count} mean={mean_value:.6f} std={std_value:.6f} "
+                f"min={min_value:.6f} max={max_value:.6f}"
+            )
     return scores, labels, paths
 
 
@@ -1038,6 +1101,13 @@ def determine_threshold(
     if np.isfinite(gaussian_based):
         threshold = min(threshold, gaussian_based)
     threshold = max(threshold - epsilon, epsilon)
+    log(
+        "threshold_components "
+        f"quantile={quantile_based:.6f} "
+        f"gaussian={gaussian_based:.6f} "
+        f"epsilon={epsilon:.6f} "
+        f"selected={threshold:.6f}"
+    )
     return float(threshold)
 
 
@@ -1084,6 +1154,14 @@ def adapt_threshold(
             best_threshold = float(candidate)
             best_f1 = f1
             best_youden = youden
+    log(
+        "adapt_threshold_summary "
+        f"base={base_threshold:.6f} "
+        f"best={best_threshold:.6f} "
+        f"best_f1={best_f1:.6f} "
+        f"best_youden={best_youden:.6f} "
+        f"candidates={candidates.size}"
+    )
     return float(max(best_threshold, epsilon))
 
 
