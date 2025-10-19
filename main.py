@@ -326,7 +326,7 @@ def resolve_backbone(requested: str) -> Tuple[str, int]:
     return "resnet18", 224
 
 
-def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
+def load_config(path: str = "setting_ai.ini") -> Tuple[AppConfig, List[str]]:
     # 設定ファイルを読み込み、アプリケーション設定と注意事項をまとめて返す
     parser = configparser.ConfigParser()
     files = parser.read(path, encoding="utf-8")
@@ -375,7 +375,7 @@ def load_config(path: str = "setting.ini") -> Tuple[AppConfig, List[str]]:
         train_dir=Path(
             parser.get("DATA", "train_data_path", fallback="data/train/good")
         ),
-        test_root=Path(parser.get("DATA", "test_data_path", fallback="data/test")),
+        test_root=Path(parser.get("DATA", "test_data_path", fallback="data")),
         val_split_ratio=max(
             0.0,
             min(
@@ -606,14 +606,20 @@ def build_datamodule(
     dm_kwargs = dict(
         name="dataset",
         normal_dir=str(cfg.data.train_dir),
-        normal_test_dir=str(cfg.data.test_root / "good"),
-        abnormal_dir=str(cfg.data.test_root / "error"),
         train_batch_size=cfg.model.batch_size,
         eval_batch_size=cfg.model.batch_size,
         num_workers=num_workers,
         val_split_ratio=cfg.data.val_split_ratio,
         augmentations=train_transform,
     )
+    if include_test_split:
+        dm_kwargs.update(
+            normal_test_dir=str(cfg.data.test_root / "good"),
+            abnormal_dir=str(cfg.data.test_root / "error"),
+        )
+    else:
+        dm_kwargs.update(normal_test_dir=None, abnormal_dir=None)
+
     if cfg.data.val_split_ratio > 0.0:
         # 検証データ用にトレーニングデータを分割するか、従来通りテストセットを利用するかを切り替える
         dm_kwargs["val_split_mode"] = "from_train" if val_from_train else "same_as_test"
